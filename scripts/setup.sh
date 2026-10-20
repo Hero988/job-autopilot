@@ -84,7 +84,7 @@ if grep -q '^MAIL_APP_PASSWORD=..*' "$MAILENV"; then
   python3 "$REPO/scripts/mail.py" check >/dev/null 2>&1 && ok "mailbox login works ($(grep '^MAIL_USER=' "$MAILENV" | cut -d= -f2-))" \
     || miss "mailbox login FAILED: check the app password with: bash .autopilot/scripts/setup.sh mail"
 else
-  miss "mail password: the owner runs 'bash .autopilot/scripts/setup.sh mail' once (or gives it in chat)"
+  miss "mail password: the owner runs 'bash $REPO/scripts/setup.sh mail' once in a terminal"
 fi
 [ -s "$CONF/PROFILE.md" ] || echo "  note: no $CONF/PROFILE.md yet (it is created as the campaign learns answers)"
 
