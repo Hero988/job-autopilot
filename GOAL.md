@@ -19,6 +19,6 @@ Ask me only for what only I can do or know (a fact not in my CV or profile, a CA
 MY SEARCH
 - Job I want: 100% remote, fully work-from-home customer service job in the UK.
 - Similar to: the remote customer service job at <company> I applied for (find it in my email, or: <link>); I want jobs very similar to it.
-- My CV: the latest CV attached in my email (or a file path / link).
+- My CV: attached to this message (or: a file path / a link / "the latest CV in my email").
 - Mailbox: you@gmail.com
 ```
