@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""mail.py - manage the job mailbox (Gmail via IMAP + SMTP with an app password). Python 3.8+, stdlib only.
+"""mail.py - manage the job mailbox: Gmail via IMAP + SMTP with an app password, or via the Gmail API with OAuth
+(for accounts without app passwords). Python 3.8+, stdlib only.
 JSON on stdout. Never prints the password. Exit 0 ok, 1 error, 2 usage.
 
-  python3 mail.py check                          login works? capabilities, special folders, SMTP login
+  python3 mail.py check                          login works? capabilities, special folders, SMTP login (or Gmail API)
+  python3 mail.py auth [CLIENT_SECRET.json]      Gmail API: sign in once in a browser, save the refresh token (setup.sh google)
   python3 mail.py search "GMAIL QUERY" [--max 20]  e.g. 'newer_than:3d -label:autopilot/seen'
   python3 mail.py show ID [--chars 4000]         headers, text body, links, codes, attachments, bounce info
   python3 mail.py codes [--minutes 30] [--to X] [--from Y]   newest verification codes + verify/confirm links
@@ -32,10 +34,15 @@ Config: ~/.config/job-autopilot/mail.env (mode 600), or the file named by $JOBS_
   optional: MAIL_IMAP_HOST=imap.gmail.com MAIL_IMAP_PORT=993 MAIL_IMAP_SSL=1
             MAIL_SMTP_HOST=smtp.gmail.com MAIL_SMTP_PORT=465 MAIL_SMTP_SSL=1 (0 = plain, STARTTLS if offered)
             MAIL_FROM_NAME="Full Name"   (display name on sent mail)
+  Gmail API instead of IMAP/SMTP (guides/gmail-api.md; `mail.py auth CLIENT.json`, run by setup.sh google, writes these):
+            MAIL_GOOGLE_CLIENT_ID=...  MAIL_GOOGLE_CLIENT_SECRET=...  MAIL_GOOGLE_REFRESH_TOKEN=...
+            (access tokens are cached in ~/.local/state/job-autopilot/token.json, mode 600)
 Python API: load_config(); `with imap() as b:` b.search(q, mx), b.show(id), b.label(id, add, remove), b.act(verb, id);
   send_message(to, subject, body, attachments=(), cc=None, reply_to_id=None) -> dict.
 """
-import email, email.policy, hashlib, html, imaplib, json, mimetypes, os, re, smtplib, socket, ssl, sys, time
+import base64, email, email.policy, getpass, hashlib, html, http.client, http.server, imaplib, json, mimetypes, os, re, secrets
+import select, smtplib, socket, ssl, sys, threading, time, urllib.error, urllib.parse, urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime
 from email.message import EmailMessage
@@ -88,7 +95,8 @@ def out(obj, code=0):
 
 def scrub(text, cfg):
     pw = cfg.get("MAIL_APP_PASSWORD") or ""
-    for s in {pw, " ".join(pw[i:i + 4] for i in range(0, len(pw), 4))} - {""}:
+    hide = [cfg.get(k) or "" for k in ("MAIL_GOOGLE_CLIENT_SECRET", "MAIL_GOOGLE_REFRESH_TOKEN", "_access_token")]
+    for s in {pw, " ".join(pw[i:i + 4] for i in range(0, len(pw), 4)), *hide} - {""}:
         text = text.replace(s, "***")
     return text
 
@@ -200,7 +208,8 @@ class Box:
     def __init__(self, cfg):
         self.cfg, user, pw = cfg, cfg.get("MAIL_USER"), cfg.get("MAIL_APP_PASSWORD")
         if not user or not pw:
-            raise MailError(f"MAIL_USER / MAIL_APP_PASSWORD missing in {cfg['path']}")
+            raise MailError(f"MAIL_USER / MAIL_APP_PASSWORD missing in {cfg['path']}: the owner runs setup.sh mail "
+                            "(app password) or setup.sh google (Gmail API, for accounts without app passwords)")
         use_ssl, host = flag(cfg.get("MAIL_IMAP_SSL"), True), cfg.get("MAIL_IMAP_HOST") or "imap.gmail.com"
         port = int(cfg.get("MAIL_IMAP_PORT") or (993 if use_ssl else 143))
         self.where = f"{host}:{port}"
@@ -300,7 +309,7 @@ class Box:
     def ident(self, folder, rec):
         if self.gmail:
             return format(int(re.search(rb"X-GM-MSGID (\d+)", rec["meta"]).group(1)), "x")
-        return f"{folder}:{re.search(rb'UID (\d+)', rec['meta']).group(1).decode()}"
+        return folder + ":" + re.search(rb"UID (\d+)", rec["meta"]).group(1).decode()
 
     def locate(self, mid):
         mid = mid.strip()
@@ -546,9 +555,335 @@ class Box:
         return res
 
 
+GMAIL_LINK = "https://mail.google.com/mail/u/0/#all/"
+API_BASE, TOKEN_URL = "https://gmail.googleapis.com/gmail/v1/users/me/", "https://oauth2.googleapis.com/token"
+AUTH_URL, SCOPE = "https://accounts.google.com/o/oauth2/v2/auth", "https://mail.google.com/"
+TOKEN_CACHE = "~/.local/state/job-autopilot/token.json"
+EXPIRED = ("Google sign-in expired or revoked: run setup.sh google again (and make sure the OAuth app is Published, "
+           "not Testing; Testing tokens expire after 7 days)")
+API_SYS = {"INBOX": "\\Inbox", "STARRED": "\\Starred", "IMPORTANT": "\\Important", "SENT": "\\Sent", "DRAFT": "\\Draft",
+           "TRASH": "\\Trash", "SPAM": "\\Spam"}
+META = ["From", "To", "Subject", "Date", "Message-ID"]
+FIELDS = "id,threadId,labelIds,snippet,internalDate,payload(headers,filename,parts(filename,parts(filename,parts(filename))))"
+
+
+def setting(cfg, key, default):  # MAIL_GOOGLE_API_BASE / MAIL_GOOGLE_TOKEN_URL: test-only overrides
+    return os.environ.get(key) or cfg.get(key) or default
+
+
+def http_json(url, data=None, headers=None, method=None):
+    """-> (HTTP status, parsed JSON body, or {"_text": first 200 characters})."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data, headers or {}, method=method), timeout=60) as r:
+            status, body = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        status, body = e.code, e.read()
+    except http.client.HTTPException as e:
+        raise MailError(f"connection to Google failed: {type(e).__name__}: {e}")
+    try:
+        return status, json.loads(body or b"{}")
+    except ValueError:
+        return status, {"_text": re.sub(r"\s+", " ", html_text(body.decode("utf-8", "replace"))[0])[:200]}
+
+
+def token_request(cfg, **fields):
+    status, res = http_json(setting(cfg, "MAIL_GOOGLE_TOKEN_URL", TOKEN_URL), urllib.parse.urlencode(fields).encode(),
+                            {"Content-Type": "application/x-www-form-urlencoded"})
+    if res.get("error") == "invalid_grant" and fields["grant_type"] == "refresh_token":
+        raise MailError(EXPIRED)
+    if status != 200 or not res.get("access_token"):
+        raise MailError(f"Google token request failed (HTTP {status}): {res.get('error') or res.get('_text')} {res.get('error_description', '')}")
+    return res
+
+
+def save_env(path, values):
+    """Set these keys in mail.env (mode 600), keeping every other line."""
+    keep = [l for l in (open(path, encoding="utf-8").read().splitlines() if os.path.isfile(path) else [])
+            if re.sub(r"^export\s+", "", l).split("=", 1)[0].strip() not in values]
+    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(keep + [f"{k}={v}" for k, v in values.items()]) + "\n")
+    os.replace(path + ".tmp", path)
+
+
+def gid(mid):
+    mid = mid.strip().rstrip("/").rsplit("/", 1)[-1].split("#")[-1]
+    if not re.fullmatch(r"[0-9a-fA-F]{1,16}", mid):
+        raise MailError(f"bad message id {mid!r}")
+    return mid.lower()
+
+
+class Api(Box):
+    """Gmail REST API with an OAuth refresh token (setup.sh google). Same interface as Box; show() and bounces()
+    are Box's, fed by message() and summary() below."""
+
+    def __init__(self, cfg):
+        self.cfg, miss = cfg, [k for k in ("MAIL_GOOGLE_CLIENT_ID", "MAIL_GOOGLE_CLIENT_SECRET", "MAIL_GOOGLE_REFRESH_TOKEN") if not cfg.get(k)]
+        if miss:
+            raise MailError(f"{', '.join(miss)} missing in {cfg['path']}: the owner runs setup.sh google")
+        self.base = setting(cfg, "MAIL_GOOGLE_API_BASE", API_BASE).rstrip("/") + "/"
+        self.gmail, self.caps, self.where, self.threads, self._folders = True, set(), self.base.split("/")[2], {}, None
+        cfg["MAIL_USER"] = cfg.get("MAIL_USER") or self.req("GET", "profile")["emailAddress"]
+
+    def token(self, fresh=False):
+        """Access token: from this process, else the cache file (mode 600), else refreshed with the refresh token."""
+        cfg, path = self.cfg, os.path.expanduser(TOKEN_CACHE)
+        key = hashlib.sha256(cfg["MAIL_GOOGLE_REFRESH_TOKEN"].encode()).hexdigest()[:16]
+        if not fresh and not cfg.get("_access_token"):
+            try:
+                c = json.load(open(path, encoding="utf-8"))
+                cfg["_access_token"] = c["access_token"] if c["key"] == key and c["expires"] > time.time() + 120 else ""
+            except (OSError, ValueError, KeyError):
+                pass
+        if fresh or not cfg.get("_access_token"):
+            r = token_request(cfg, grant_type="refresh_token", refresh_token=cfg["MAIL_GOOGLE_REFRESH_TOKEN"],
+                              client_id=cfg["MAIL_GOOGLE_CLIENT_ID"], client_secret=cfg["MAIL_GOOGLE_CLIENT_SECRET"])
+            cfg["_access_token"] = r["access_token"]  # in cfg so scrub() hides it too
+            try:
+                os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+                with os.fdopen(os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+                    json.dump({"key": key, "access_token": r["access_token"], "expires": time.time() + int(r.get("expires_in", 3600))}, f)
+                os.replace(path + ".tmp", path)
+            except OSError:
+                pass
+        return cfg["_access_token"]
+
+    def req(self, method, path, body=None, **query):
+        url = self.base + path + ("?" + urllib.parse.urlencode(query, doseq=True) if query else "")
+        for retry in (False, True):  # one retry with a fresh token after 401
+            status, res = http_json(url, None if body is None else json.dumps(body).encode(),
+                                    {"Authorization": "Bearer " + self.token(retry), "Content-Type": "application/json"}, method)
+            if status != 401:
+                break
+        if status >= 400:
+            err = res.get("error") if isinstance(res.get("error"), dict) else {}
+            msg = err.get("message") or res.get("_text") or str(res)[:200]
+            hint = "; enable the Gmail API in the Cloud project (setup.sh google, step 3)" if "has not been used" in msg or "disabled" in msg else ""
+            raise MailError(f"Gmail API {method} {path}: HTTP {status}: {msg}{hint}")
+        return res
+
+    def get1(self, mid, fmt="minimal"):
+        try:
+            return self.req("GET", "messages/" + gid(mid), format=fmt)
+        except MailError as e:
+            raise MailError(f"message {gid(mid)} not found") if re.search(r"HTTP (404|400)", str(e)) else e
+
+    @property
+    def folders(self):  # user label names; loaded on first use
+        if self._folders is None:
+            self.load_folders()
+        return self._folders
+
+    def load_folders(self):
+        labels = self.req("GET", "labels").get("labels", [])
+        self.ids = {l["name"]: l["id"] for l in labels}
+        self.names = {l["id"]: l["name"] for l in labels if l.get("type") == "user"}
+        self._folders = {n: [] for n in sorted(self.names.values())}
+
+    def specials(self):
+        return {"All": "(All Mail)", "Trash": "TRASH", "Drafts": "DRAFT", "Sent": "SENT", "Junk": "SPAM"}
+
+    def label_folder(self, label):
+        return "INBOX" if label.lower() in ("inbox", "\\inbox") else label
+
+    def lid(self, label):
+        """Label name -> id (system labels inbox/starred/important by name), or None."""
+        if label.lower().lstrip("\\") in SYSTEM:
+            return label.lstrip("\\").upper()
+        self.folders  # loads self.ids
+        return self.ids.get(label) or next((i for n, i in self.ids.items() if n.lower() == label.lower()), None)
+
+    def ensure_label(self, label):
+        parts = label.split("/")
+        for name in ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]:  # parents first, so Gmail nests them
+            if not self.lid(name):
+                try:
+                    r = self.req("POST", "labels", {"name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"})
+                    self.ids[name], self.names[r["id"]], self._folders[name] = r["id"], name, []
+                except MailError:
+                    self.load_folders()  # created meanwhile by a helper?
+                    if not self.lid(name):
+                        raise
+        return self.lid(label)
+
+    def names_of(self, ids):
+        self.folders  # loads self.names
+        return [API_SYS.get(i) or self.names.get(i) for i in ids or [] if i in API_SYS or i in self.names]
+
+    def summary(self, folder, rec):
+        msg, ids, full = rec["msg"], rec.get("labelIds") or [], "snippet" not in rec
+        t = int(rec.get("internalDate") or 0) / 1000 or time.time()
+        try:
+            date = parsedate_to_datetime(hdr(msg, "Date")).isoformat()
+        except Exception:
+            date = datetime.fromtimestamp(t).isoformat()
+        return {"id": rec["id"], "thread": rec.get("threadId"), "date": date, "from": hdr(msg, "From"), "to": hdr(msg, "To"),
+                "subject": hdr(msg, "Subject"), "labels": self.names_of(ids), "unread": "UNREAD" in ids, "starred": "STARRED" in ids,
+                "snippet": re.sub(r"\s+", " ", text_of(msg)[0] if full else html.unescape(rec["snippet"]))[:200],
+                "has_attachments": bool(atts_of(msg)) if full else rec["has_attachments"],
+                "_t": t, "_mid": hdr(msg, "Message-ID"), "link": GMAIL_LINK + rec["id"]}
+
+    def meta(self, mid):
+        """Headers, labels, snippet and attachment flag without the body (format=full, trimmed by `fields`)."""
+        for extra in ({"fields": FIELDS}, {}):  # a rejected `fields` selector must not break searching
+            try:
+                rec = self.req("GET", "messages/" + mid, format="full", **extra)
+                break
+            except MailError as e:
+                if "HTTP 404" in str(e):
+                    return None  # deleted meanwhile: skip
+                if not (extra and "HTTP 400" in str(e)):
+                    return e
+        has_file = lambda p: bool(p.get("filename")) or any(has_file(x) for x in p.get("parts", []))
+        heads = "".join(h["name"] + ": " + " ".join(str(h.get("value", "")).splitlines()) + "\n"
+                        for h in rec.get("payload", {}).get("headers", []) if h["name"].lower() in {m.lower() for m in META})
+        rec.update(msg=email.message_from_string(heads + "\n", policy=email.policy.default), has_attachments=has_file(rec.get("payload", {})))
+        rec.setdefault("snippet", "")
+        return rec
+
+    def search(self, query, mx=20):
+        ids, page = [], None
+        while len(ids) < mx:
+            query_args = {"q": query, "maxResults": min(mx - len(ids), 500), "includeSpamTrash":
+                          str(bool(re.search(r"(^|\s)in:(trash|bin|spam|anywhere)\b", query))).lower()}
+            r = self.req("GET", "messages", **query_args, **({"pageToken": page} if page else {}))
+            ids, page = ids + [m["id"] for m in r.get("messages", [])], r.get("nextPageToken")
+            if not page or not r.get("messages"):
+                break
+        self.token()
+        with ThreadPoolExecutor(8) as pool:  # Gmail allows ~50 message reads a second per user
+            recs = list(pool.map(self.meta, ids))
+        for e in recs:
+            if isinstance(e, Exception):
+                raise e
+        return [{k: v for k, v in self.summary(None, r).items() if not k.startswith("_")} for r in recs if r]
+
+    def message(self, mid):
+        rec = self.get1(mid, "raw")
+        rec["msg"] = msg = parse(base64.urlsafe_b64decode(rec["raw"] + "=" * (-len(rec["raw"]) % 4)))
+        rec["meta"] = b"INTERNALDATE " + imaplib.Time2Internaldate(int(rec["internalDate"]) / 1000).encode()  # for Box.bounces
+        self.threads[hdr(msg, "Message-ID")] = rec["threadId"]  # replies and reply drafts join this thread
+        ids = rec.get("labelIds", [])
+        return ("Trash" if "TRASH" in ids else "Spam" if "SPAM" in ids else "Drafts" if "DRAFT" in ids else "All Mail"), rec, msg
+
+    def modify(self, mid, add=(), remove=()):
+        self.req("POST", f"messages/{gid(mid)}/modify", {"addLabelIds": list(add), "removeLabelIds": list(remove)})
+        return gid(mid)
+
+    def label(self, mid, add=(), remove=()):
+        return self.modify(mid, [self.ensure_label(l) for l in add], [i for i in map(self.lid, remove) if i])
+
+    def protected(self, mid):
+        labels = self.names_of(self.get1(mid).get("labelIds"))
+        why = [l for l in labels if l.lower().startswith("jobs/") or l in ("\\Starred", "\\Important")]
+        return ", ".join(dict.fromkeys(why + (["starred"] if "\\Starred" in labels else [])))
+
+    def act(self, verb, mid):
+        mid = gid(mid)
+        mods = {"read": ([], ["UNREAD"]), "unread": (["UNREAD"], []), "star": (["STARRED"], []), "unstar": ([], ["STARRED"]),
+                "archive": ([], ["INBOX"]), "spam": (["SPAM"], ["INBOX"])}
+        if verb in mods:
+            return self.modify(mid, *mods[verb])
+        if verb == "trash":
+            self.req("POST", f"messages/{mid}/trash")
+            return mid
+        ids = self.get1(mid).get("labelIds", [])
+        if not {"TRASH", "SPAM"} & set(ids):
+            raise MailError(f"{mid} is not in Trash/Spam" + ("; trash it first" if verb == "delete" else ""))
+        if verb == "untrash":  # back to the inbox, as on IMAP
+            if "TRASH" in ids:
+                self.req("POST", f"messages/{mid}/untrash")
+            return self.modify(mid, ["INBOX"], ["SPAM"] if "SPAM" in ids else [])
+        self.req("DELETE", "messages/" + mid)  # permanent; needs the https://mail.google.com/ scope
+
+    def send(self, msg, draft=False):
+        m = {"raw": base64.urlsafe_b64encode(msg.as_bytes()).decode()}
+        if self.threads.get(hdr(msg, "In-Reply-To")):
+            m["threadId"] = self.threads[hdr(msg, "In-Reply-To")]
+        return self.req("POST", "drafts", {"message": m})["message"]["id"] if draft else self.req("POST", "messages/send", m)["id"]
+
+    def append(self, kind, msg, flags):  # only Drafts here (Gmail files sent mail itself)
+        return self.send(msg, draft=True)
+
+
+def auth(path=None):
+    """Installed-app OAuth (loopback + PKCE): sign in once, save the refresh token in mail.env. Prompts go to stderr."""
+    cfg, say = load_config(), lambda s: print(s, file=sys.stderr, flush=True)
+    cid, secret = cfg.get("MAIL_GOOGLE_CLIENT_ID"), cfg.get("MAIL_GOOGLE_CLIENT_SECRET")
+    if path:
+        j = json.load(open(os.path.expanduser(path), encoding="utf-8"))
+        j = j.get("installed") or j.get("web") or {}
+        cid, secret = j.get("client_id"), j.get("client_secret")
+    if not (cid and secret) and sys.stdin.isatty():
+        cid, secret = input("OAuth Client ID: ").strip(), getpass.getpass("Client secret (hidden): ").strip()
+    if not (cid and secret):
+        raise MailError("auth needs the downloaded OAuth client JSON (mail.py auth client_secret_....json) or a Client ID and secret")
+    verifier, state, got = secrets.token_urlsafe(64), secrets.token_urlsafe(16), {}
+
+    def take(qs):
+        if qs.get("state", [state])[0] != state:
+            return say("That address is from an older sign-in link: use the newest one.")
+        got.update({k: qs[k][0] for k in ("code", "error") if qs.get(k)})
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            take(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(("Signed in. Close this tab and go back to the terminal." if got.get("code") else
+                              "job-autopilot sign-in: " + got.get("error", "waiting")).encode())
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    redirect = f"http://127.0.0.1:{srv.server_port}/"
+    url = AUTH_URL + "?" + urllib.parse.urlencode(dict(
+        client_id=cid, redirect_uri=redirect, response_type="code", scope=SCOPE, access_type="offline", prompt="consent", state=state,
+        code_challenge=base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("="),
+        code_challenge_method="S256", **({"login_hint": cfg["MAIL_USER"]} if cfg.get("MAIL_USER") else {})))
+    say(f"\nOpen this link in a browser (any computer; or the agent's shared browser via browser.py share):\n\n{url}\n\n"
+        "Choose the job mailbox account. On \"Google hasn't verified this app\": Advanced > Go to job-autopilot (unsafe).\n"
+        "Tick full Gmail access if asked, then Continue. If the browser ends on a page that can't be reached\n"
+        "(an address starting http://127.0.0.1), copy that whole address from the address bar and paste it here.\n")
+    stdin_open, deadline = True, time.time() + 900
+    while not got and time.time() < deadline:
+        if stdin_open and select.select([sys.stdin], [], [], 0.5)[0]:
+            line = sys.stdin.readline()
+            stdin_open = bool(line)
+            if line.strip():
+                take(urllib.parse.parse_qs(line.strip().split("?", 1)[-1].split("#")[0]) if "code=" in line or "error=" in line
+                     else {"code": [line.strip()]})
+        elif not stdin_open:
+            time.sleep(0.5)
+    srv.shutdown()
+    if not got.get("code"):
+        raise MailError("sign-in " + (f"refused: {got['error']}" if got.get("error") else "timed out (15 minutes)") + "; run it again")
+    res = token_request(cfg, grant_type="authorization_code", code=got["code"], client_id=cid, client_secret=secret,
+                        redirect_uri=redirect, code_verifier=verifier)
+    if SCOPE not in res.get("scope", SCOPE).split():
+        raise MailError("full Gmail access was not granted (the box was unticked?); run it again and allow it")
+    if not res.get("refresh_token"):
+        raise MailError("Google sent no refresh token: remove job-autopilot at myaccount.google.com/permissions, then run it again")
+    status, prof = http_json(setting(cfg, "MAIL_GOOGLE_API_BASE", API_BASE).rstrip("/") + "/profile",
+                             headers={"Authorization": "Bearer " + res["access_token"]})
+    if status != 200 or not prof.get("emailAddress"):
+        msg = (prof.get("error") or {}).get("message", "") if isinstance(prof.get("error"), dict) else prof.get("_text", "")
+        raise MailError(f"signed in, but the Gmail API refused (HTTP {status}): {msg} (is the Gmail API enabled in the project?)")
+    save_env(cfg["path"], {"MAIL_USER": prof["emailAddress"], "MAIL_GOOGLE_CLIENT_ID": cid, "MAIL_GOOGLE_CLIENT_SECRET": secret,
+                           "MAIL_GOOGLE_REFRESH_TOKEN": res["refresh_token"]})
+    return {"ok": True, "user": prof["emailAddress"], "saved": cfg["path"], "refresh_token_length": len(res["refresh_token"])}
+
+
 @contextmanager
 def imap(cfg=None):
-    b = Box(cfg or load_config())
+    cfg = cfg or load_config()
+    if cfg.get("MAIL_GOOGLE_REFRESH_TOKEN"):  # Gmail API: nothing to log out of
+        yield Api(cfg)
+        return
+    b = Box(cfg)
     try:
         yield b
     finally:
@@ -601,13 +936,16 @@ def send_message(to, subject, body, attachments=(), cc=None, reply_to_id=None, c
     cfg = cfg or load_config()
     with imap(cfg) as b:
         msg = build(cfg, to, subject, body, attachments, cc, b.message(reply_to_id)[2] if reply_to_id else None)
-        refused = smtp_send(cfg, msg)
-        # Gmail files sent mail itself; other servers need a copy APPENDed to Sent
-        mid = b.find_msgid(b.special["All"], msg["Message-ID"], tries=5) if b.gmail else b.append("Sent", msg, "(\\Seen)")
+        if isinstance(b, Api):
+            mid, refused = b.send(msg), {}
+        else:
+            refused = smtp_send(cfg, msg)
+            # Gmail files sent mail itself; other servers need a copy APPENDed to Sent
+            mid = b.find_msgid(b.special["All"], msg["Message-ID"], tries=5) if b.gmail else b.append("Sent", msg, "(\\Seen)")
         res = {"sent": True, "message_id": msg["Message-ID"], "id": mid, "to": msg["To"], "subject": subject,
                "attachments": [os.path.basename(a) for a in attachments], "refused": refused}
         if b.gmail and mid:
-            res["link"] = "https://mail.google.com/mail/u/0/#all/" + mid
+            res["link"] = GMAIL_LINK + mid
         return res
 
 
@@ -625,7 +963,7 @@ def parse_args(argv, flags=("--permanent", "--force")):
     return pos, opt
 
 
-CMDS = ("check search show codes attachments labels mklabel label archive trash untrash spam read unread star unstar "
+CMDS = ("auth check search show codes attachments labels mklabel label archive trash untrash spam read unread star unstar "
         "delete bounces send reply draft").split()
 
 
@@ -638,6 +976,8 @@ def main(argv):
     one = lambda k, d=None: opt.get(k, [d])[-1]
     body = open(one("--body-file"), encoding="utf-8").read() if one("--body-file") else one("--body")
     cfg = load_config()
+    if cmd == "auth":
+        out(auth(pos[0] if pos else None))
     if cmd == "send":
         if not (one("--to") and one("--subject") and body is not None):
             out({"error": "send needs --to, --subject and --body or --body-file"}, 2)
@@ -662,8 +1002,15 @@ def main(argv):
             res["journal"] = True
         out(res)
     with imap(cfg) as b:
+        if cmd == "check" and isinstance(b, Api):
+            res = {"ok": True, "backend": "api", "user": cfg["MAIL_USER"], "account": b.req("GET", "profile")["emailAddress"],
+                   "api": b.where, "refresh_token_length": len(cfg["MAIL_GOOGLE_REFRESH_TOKEN"]), "gmail": True,
+                   "labels": len(b.folders), "special": b.specials()}
+            if res["account"].lower() != res["user"].lower():
+                res["warning"] = "MAIL_USER differs from the signed-in Google account; mail is sent from " + res["account"]
+            out(res)
         if cmd == "check":
-            res = {"ok": True, "user": cfg["MAIL_USER"], "password_length": len(cfg["MAIL_APP_PASSWORD"]), "imap": b.where,
+            res = {"ok": True, "backend": "imap", "user": cfg["MAIL_USER"], "password_length": len(cfg["MAIL_APP_PASSWORD"]), "imap": b.where,
                    "gmail": b.gmail, "capabilities": sorted(b.caps), "folders": len(b.folders), "special": b.specials()}
             try:
                 smtp_send(cfg, None)

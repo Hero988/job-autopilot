@@ -40,6 +40,10 @@ the owner.
 - **IMAP/SMTP with an app password, not a connector.** It works in every harness. It can do all the
   management the owner wants (labels, archive, trash, drafts, send) and it shows codes that
   connectors hide. Special folders are found by flag, because UK accounts use `[Google Mail]/`.
+- **Gmail API as the alternative** for accounts where Google offers no App passwords. It is free,
+  and it reuses the same message building and parsing, with labels per message. The OAuth app must
+  be published, not left in Testing, because Testing refresh tokens expire after 7 days. An Apps
+  Script bridge was considered and dropped as an extra moving part.
 - **Aliases.** Gmail plus-addressing: `you+<site>@gmail.com` reaches the same inbox, keeps
   each site's mail separate, and shows which site leaked an address. If a site rejects `+`, the
   agent uses the plain address.

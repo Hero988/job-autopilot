@@ -38,10 +38,12 @@ If a boundary is unclear for an action, don't take it: ask, and keep working on 
 
 ## First run
 1. `bash .autopilot/scripts/setup.sh` (safe to re-run). Put the goal's mailbox address in
-   `MAIL_USER=` in `~/.config/job-autopilot/mail.env`. If the password is missing, ask the owner to
-   run `bash <absolute path>/.autopilot/scripts/setup.sh mail` in a terminal (it hides what they
-   type). Meanwhile fill `TARGET.md` from the goal's words, start the browser and start finding jobs
-   (loop step 3); do whatever needs the mailbox once it works.
+   `MAIL_USER=` in `~/.config/job-autopilot/mail.env`. If the mailbox isn't connected, ask the owner
+   to run, in a terminal, `bash <absolute path>/.autopilot/scripts/setup.sh mail` (Google App
+   password) or, if their account has no App passwords, `... setup.sh google` (Gmail API,
+   `guides/gmail-api.md`). Until it works, use your harness's Gmail tool if it has one, or have
+   the owner sign in to Gmail in the shared browser (handoff) and manage mail there by the same
+   rules. Meanwhile fill `TARGET.md` from the goal's words and start finding jobs (loop step 3).
 2. **CV:** copy it into `cv/` (from a path, a link, or `mail.py attachments` if it is in the mailbox).
    Extract the text (`pdftotext`) and fill `PROFILE.md` from it. Keep the original file for uploads.
    Then ask the owner once, in one batch, for the facts forms often require that are still unknown
@@ -72,8 +74,7 @@ Repeat, sending helpers out in parallel where they help:
 5. **Record:** rewrite the Now block of `STATE.md`, add `JOURNAL.md` lines, and keep going. Around
    20:00 UK time, give the owner the day's summary in chat.
 
-There is always something to do: new sources, other job boards, company career pages, alerts to
-set up, waiting applications to unblock. If you truly run dry, sweep mail, wait 15 minutes and
+There is always something to do: new sources, career pages, job alerts, waiting applications. If you truly run dry, sweep mail, wait 15 minutes and
 search again. A blocked form, an unanswered ask or a quiet hour is never a reason to stop.
 
 **Helpers:** use subagents or parallel workers for independent applications and searches. Each

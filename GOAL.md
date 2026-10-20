@@ -4,8 +4,9 @@
    Cursor, OpenCode, T3 Code, anything that can run shell commands).
 2. Edit the `MY SEARCH` lines (any job, any field), then paste everything inside the block.
 
-The first time on a machine, the agent asks you to run `bash .autopilot/scripts/setup.sh mail` once
-to enter the Gmail app password privately. Everything else it does itself.
+The first time on a machine, the agent asks you to connect the mailbox once: `setup.sh mail` with a
+Google App password, or `setup.sh google` (Gmail API) if your account has no App passwords (see the README).
+Everything else it does itself.
 
 ```text
 /goal Run my job search from this folder until I get a job offer. Find and apply to as many matching jobs as you can every day, create the site accounts you need, track every application, and manage my mailbox fully. Done only when an email offers me a job: then stop applying, tell me, and end with the STATUS line from STATE.md showing OFFER.
