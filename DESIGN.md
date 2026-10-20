@@ -6,7 +6,7 @@ Why job-autopilot is built the way it is. Not read by campaigns.
 1. **The ChatGPT run** (shared chat "Resume job search monitoring", 19–20 October 2026). A cloud
    browser, the Gmail connector and two scheduled automations made about 7 real applications in a
    day against a target of 40–50. On the next day it made none.
-2. **The bug-bounty work** (`Hero988/bounty-playbook`, `bounty-notes`). Its first two repos died of
+2. **An earlier agent playbook for bug-bounty research.** Its first two versions died of
    complexity: 32,000 lines of code, 28,000 lines of tests, and 43% of agent effort spent on the tool
    itself. The rebuild that worked is a short method file, two small helper scripts, owner asks that
    never block, and plus-address aliases read over IMAP.
@@ -40,7 +40,7 @@ the owner.
 - **IMAP/SMTP with an app password, not a connector.** It works in every harness. It can do all the
   management the owner wants (labels, archive, trash, drafts, send) and it shows codes that
   connectors hide. Special folders are found by flag, because UK accounts use `[Google Mail]/`.
-- **Aliases.** Gmail plus-addressing: `ameer1111888+<site>@gmail.com` reaches the same inbox, keeps
+- **Aliases.** Gmail plus-addressing: `you+<site>@gmail.com` reaches the same inbox, keeps
   each site's mail separate, and shows which site leaked an address. If a site rejects `+`, the
   agent uses the plain address.
 - **Owner asks use the harness's own chat** (the owner's choice), not a separate tool. Built-in

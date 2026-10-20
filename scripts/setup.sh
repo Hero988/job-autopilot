@@ -20,8 +20,8 @@ if [ "${1:-}" = "mail" ]; then
   echo "Mailbox for the job agent. Use a Google App password (Google Account > Security > 2-Step Verification >"
   echo "App passwords), not your normal password. IMAP is on by default for Gmail."
   cur_user="$(grep -s '^MAIL_USER=' "$MAILENV" | cut -d= -f2-)"
-  read -r -p "Gmail address [${cur_user:-ameer1111888@gmail.com}]: " user
-  user="${user:-${cur_user:-ameer1111888@gmail.com}}"
+  read -r -p "Gmail address${cur_user:+ [$cur_user]}: " user
+  user="${user:-$cur_user}"
   read -r -s -p "App password (16 letters, hidden): " pw; echo
   umask 077
   cat > "$MAILENV" <<EOF

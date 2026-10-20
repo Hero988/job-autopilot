@@ -1,4 +1,4 @@
-# job-autopilot (private)
+# job-autopilot
 
 An AI agent that runs your job search until you get an offer. You give it three things: the job you
 want, a similar job (a link, or "find it in my email"), and your CV. It then:
@@ -65,3 +65,12 @@ Lessons from the bug-bounty playbook, whose earlier versions collapsed under the
 - **No new mechanisms** (scripts, states, required fields) unless the agent lacks a capability
   entirely, or for safety.
 - **No tests, no CI.** The scripts are checked by running them.
+
+## Use it responsibly
+You are responsible for what the agent submits in your name. It is told never to invent facts, never
+to solve CAPTCHAs or bypass site security, and never to reply to anyone without your approval, but
+check its work. Some job boards (LinkedIn, Indeed) forbid automated use in their terms; the guides
+keep the agent on employer sites where possible.
+
+## Licence
+MIT, see [LICENSE](LICENSE).
