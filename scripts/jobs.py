@@ -2,11 +2,11 @@
 """jobs.py - find job openings in public job APIs and feeds. Python 3.8+, stdlib only. JSON on stdout.
 
   python3 jobs.py search --q "customer service" [--q "customer support"].. [--where uk|europe|anywhere]
-                  [--days 14] [--max 100] [--per-company 3] [--new] [--remote] [--desc] [--json-lines]
-        Ask every source at once and keep jobs whose title contains any --q (case-insensitive; --desc also
-        searches the description), that a person in --where may take (default anywhere), posted in the last
-        --days (0 = any age). Deduped by URL and company+title, newest first. Prints
-        {"count","jobs":[{title,company,location,remote,url,posted,source,salary,snippet}],"errors":[..],
+                  [--days 14] [--max 100] [--per-company 3] [--new] [--remote] [--title-only] [--json-lines]
+        Ask every source at once and keep jobs whose title or description contains any --q (case-insensitive;
+        --title-only: title only), that a person in --where may take (default anywhere), posted in the last
+        --days (0 = any age). Deduped by URL and company+title; title matches first, then newest. Prints
+        {"count","jobs":[{title,company,location,remote,url,posted,source,salary,snippet,match}],"errors":[..],
          "sources":{name:kept},"fetched":{name:raw},"keyed_sources_off":[..]}
         --new          hide jobs whose URL or company+role is already in ./applications.csv
         --remote       keep only jobs marked remote, or unknown but saying remote/work from home
@@ -335,9 +335,12 @@ def refine(rows, a, cap=0):
     urls, keys = tracked() if a["new"] else (set(), set())
     per, kept = {}, []
     for j in sorted(rows, key=lambda j: -j["_t"]):
-        hay = re.sub(r"[\s\-/]+", " ", (j["title"] + (" " + j["_desc"] if a["desc"] else "")).lower())
+        title = re.sub(r"[\s\-/]+", " ", j["title"].lower())
+        desc = "" if a["title_only"] else re.sub(r"[\s\-/]+", " ", j["_desc"].lower())
+        j["match"] = "title" if any(w in title for w in words or [""]) else \
+            "description" if desc and any(w in desc for w in words) else None
         remote = j["remote"] or (j["remote"] is None and REMOTE_TXT.search(j["title"] + " " + j["location"]))
-        if not (j["title"] and j["url"]) or not any(w in hay for w in words or [""]) or (a["remote"] and not remote) \
+        if not (j["title"] and j["url"]) or not j["match"] or (a["remote"] and not remote) \
                 or not eligible(j["location"], a["where"]) or (cutoff and j["_t"] and j["_t"] < cutoff):
             continue
         u, k, c = norm_url(j["url"]), norm_key(j["company"], j["title"]), j["company"].lower()
@@ -347,7 +350,7 @@ def refine(rows, a, cap=0):
         keys.add(k)
         per[c] = per.get(c, 0) + 1
         kept.append({x: y for x, y in j.items() if not x.startswith("_")})
-    return kept
+    return sorted(kept, key=lambda j: j["match"] != "title")  # stable: newest first within each group
 
 # ---------------------------------------------------------------- commands
 def usage():
@@ -356,7 +359,7 @@ def usage():
 
 def parse(argv):
     a = {"q": [], "where": "anywhere", "days": None, "max": 100, "per_company": 3, "new": False, "remote": False,
-         "desc": False, "json_lines": False, "pos": []}
+         "title_only": False, "json_lines": False, "pos": []}
     it = iter(argv)
     for t in it:
         k = t[2:].replace("-", "_")
@@ -368,7 +371,7 @@ def parse(argv):
                 a["q"].append(v)
             else:
                 a[k] = v if t == "--where" else (int(v) if v.isdigit() else usage())
-        elif t in ("--new", "--remote", "--desc", "--json-lines"):
+        elif t in ("--new", "--remote", "--title-only", "--json-lines"):
             a[k] = True
         elif t.startswith("-"):
             usage()
