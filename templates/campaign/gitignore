@@ -1,0 +1,6 @@
+secrets/
+.venv/
+cv/
+evidence/
+*.lock
+*.tmp

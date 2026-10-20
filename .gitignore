@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+secrets/
+*.lock
+*.tmp
+mail.env
