@@ -20,8 +20,8 @@ python3 .autopilot/scripts/browser.py stop        # everything down; only when t
 tab but one `about:blank`; use it only when no other agent is working.
 
 ## Connecting with Playwright
-Install Playwright once in the campaign venv: `python3 -m venv .venv && .venv/bin/pip install
-playwright`. Do **not** run `playwright install`: you connect to the system Chrome and never
+Run browser code with `./.venv/bin/python` (setup.sh installed Playwright there; system `python3`
+has no Playwright). Do **not** run `playwright install`: you connect to the system Chrome and never
 launch one.
 
 ```python
@@ -70,8 +70,8 @@ an SMS code typed on the page. The procedure:
      press Submit");
    - "this link gives full control of the job browser and expires at <expires>";
    - "reply 'done' when finished".
-4. **Never write the link into any file**: not STATE.md, JOURNAL.md, notes, commits or logs. The
-   password is in the link. In STATE.md, note the open handoff under **"Handoff open"** with the
+4. **Never write the link into any file**: not STATE.md, JOURNAL.md, notes, commits or logs (only
+   browser.py's private state keeps it, mode 600). The password is in the link. In STATE.md, note the open handoff under **"Handoff open"** with the
    site and tab title only.
 5. Keep working on other applications in background tabs while you wait (`new_tab` doesn't
    disturb the owner's window). Don't navigate, reload or close the handoff tab.

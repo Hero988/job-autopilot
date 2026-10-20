@@ -287,7 +287,7 @@ def tunnel_url(pid):
 def share(minutes):
     sh = load(SJSON)
     if share_alive(sh):
-        return {"url": sh["url"], "expires": sh["expires"]}
+        return {"url": sh["url"], "expires": sh["expires"], "note": "already shared; unshare first for a new expiry"}
     unshare()
     start()
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # campaign folder
@@ -418,7 +418,7 @@ def main(a):
     if cmd == "close" and len(a) > 1:
         out(close([x for x in a[1:] if x != "--all"], "--all" in a))
     if cmd == "share":
-        m = a[a.index("--minutes") + 1] if "--minutes" in a[:-1] else "60"
+        m = (a[a.index("--minutes") + 1] if "--minutes" in a[:-1] else "") if "--minutes" in a else "60"
         if not m.isdigit() or int(m) < 1:
             out({"error": "--minutes must be a positive whole number"}, 2)
         out(share(int(m)))

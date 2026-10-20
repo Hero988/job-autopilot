@@ -3,9 +3,10 @@
 Python 3.8+, stdlib only. Run from the campaign folder. File-locked, so parallel helpers are safe.
 
   python3 track.py add --company C --role R --url U [--source S] [--notes N] [--status QUEUED]
-        -> {"id": ...} or {"duplicate": id, "status": ...}   (same URL, or same company + role)
+        -> {"id": ...} or {"duplicate": id, ...}. Same URL = same job. Same company + role at another URL is
+           reported too; if it really is a separate vacancy (other location or reference), re-run with --force.
   python3 track.py claim ID [--by NAME]       QUEUED/WAITING/FAILED -> WORKING (refused if another worker has it, < 2h)
-  python3 track.py set ID STATUS [--method M] [--email E] [--confirmation TEXT] [--ask Qn] [--note TEXT]
+  python3 track.py set ID STATUS [--method M] [--email E] [--confirmation TEXT] [--note TEXT]
   python3 track.py find TEXT                  search company, role, url, notes
   python3 track.py next [--n 5]               oldest QUEUED jobs
   python3 track.py list [--status S] [--days N]
@@ -14,10 +15,11 @@ Python 3.8+, stdlib only. Run from the campaign folder. File-locked, so parallel
 
   python3 track.py acct new SITE [--email E] [--url U]   unique strong password, saved to secrets/accounts.json
         (mode 600). Default email: plus-alias of MAIL_USER, e.g. you+workday-acme@gmail.com. Prints no password.
+        For an existing SITE, --email changes its address (e.g. the site rejected "+"); the password stays.
   python3 track.py acct list | acct get SITE  (never prints passwords; your browser code reads the json file)
 
 Statuses: QUEUED WORKING WAITING SUBMITTED FAILED SKIPPED INTERVIEW REJECTED OFFER
-  QUEUED found and matches TARGET.md, not started   WAITING needs the owner (--ask Qn)
+  QUEUED found and matches TARGET.md, not started   WAITING needs the owner (--note the question)
   SUBMITTED proven (success page or acknowledgement) FAILED could not be completed (--note why)
   SKIPPED doesn't match (--note the one-line reason) INTERVIEW / REJECTED / OFFER from the mailbox
 """
@@ -34,7 +36,7 @@ except ImportError:  # Python < 3.9
 CSV_PATH = "applications.csv"
 ACCOUNTS = os.path.join("secrets", "accounts.json")
 FIELDS = ["id", "found", "company", "role", "url", "source", "status", "updated", "applied", "method",
-          "email", "confirmation", "ask", "notes"]
+          "email", "confirmation", "notes"]
 STATUSES = ["QUEUED", "WORKING", "WAITING", "SUBMITTED", "FAILED", "SKIPPED", "INTERVIEW", "REJECTED", "OFFER"]
 SENT = {"SUBMITTED", "INTERVIEW", "REJECTED", "OFFER"}
 
@@ -92,8 +94,26 @@ def locked():
         lock.close()
 
 
+ALIASES = {"--notes": "--note"}
+KNOWN = {"--company", "--role", "--url", "--source", "--note", "--status", "--by", "--method", "--email",
+         "--confirmation", "--n", "--days", "--force"}
+
+
 def opt(a, name, default=None):
-    return a[a.index(name) + 1] if name in a and a.index(name) + 1 < len(a) else default
+    for i, t in enumerate(a):
+        if ALIASES.get(t, t) == ALIASES.get(name, name):
+            if name == "--force":
+                return True
+            if i + 1 >= len(a) or a[i + 1].startswith("--"):
+                out({"error": f"{name} needs a value"}, 2)
+            return a[i + 1]
+    return default
+
+
+def check_flags(a):
+    bad = [t for t in a if t.startswith("--") and ALIASES.get(t, t) not in KNOWN]
+    if bad:
+        out({"error": f"unknown option {bad[0]}; run track.py with no arguments for usage"}, 2)
 
 
 def get(rows, rid):
@@ -104,7 +124,7 @@ def get(rows, rid):
 
 
 def brief(r):
-    return {k: r[k] for k in ("id", "status", "company", "role", "url", "updated", "ask", "notes") if r.get(k)}
+    return {k: r[k] for k in ("id", "status", "company", "role", "url", "updated", "notes") if r.get(k)}
 
 
 def cmd_add(a):
@@ -117,12 +137,16 @@ def cmd_add(a):
     nu, key = norm_url(url), (norm_text(company), norm_text(role))
     with locked() as box:
         for r in box["rows"]:
-            if (nu and norm_url(r["url"]) == nu) or (norm_text(r["company"]), norm_text(r["role"])) == key:
+            if nu and norm_url(r["url"]) == nu:
                 out({"duplicate": r["id"], "status": r["status"], "company": r["company"], "role": r["role"]})
+        for r in box["rows"]:
+            if (norm_text(r["company"]), norm_text(r["role"])) == key and not opt(a, "--force"):
+                out({"duplicate": r["id"], "status": r["status"], "company": r["company"], "role": r["role"],
+                     "url": r["url"], "hint": "same company and role; if this is a separate vacancy, add --force"})
         n = max([int(r["id"][1:]) for r in box["rows"] if re.fullmatch(r"A\d+", r["id"])] + [0]) + 1
         row = {k: "" for k in FIELDS}
         row.update(id=f"A{n}", found=now(), updated=now(), company=company, role=role, url=url,
-                   source=opt(a, "--source", ""), status=status, notes=opt(a, "--notes", ""))
+                   source=opt(a, "--source", ""), status=status, notes=opt(a, "--note", ""))
         box["rows"].append(row)
         box["dirty"] = True
     out({"id": row["id"], "status": status})
@@ -160,8 +184,7 @@ def cmd_set(a):
             r["notes"] = re.sub(r"\s*\[by [^\]]+\]", "", r["notes"])
         if status == "SUBMITTED" and not r["applied"]:
             r["applied"] = now()
-        for flag, field in (("--method", "method"), ("--email", "email"), ("--confirmation", "confirmation"),
-                            ("--ask", "ask")):
+        for flag, field in (("--method", "method"), ("--email", "email"), ("--confirmation", "confirmation")):
             if opt(a, flag) is not None:
                 r[field] = opt(a, flag)
         if opt(a, "--note"):
@@ -230,23 +253,41 @@ def mail_user():
     return ""
 
 
+def slug(site):
+    return re.sub(r"[^a-z0-9]+", "-", site.lower()).strip("-")
+
+
+def save_accounts(data):
+    tmp = f"{ACCOUNTS}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, ACCOUNTS)
+
+
 def cmd_acct(a):
     sub = a[1] if len(a) > 1 else ""
     os.makedirs("secrets", mode=0o700, exist_ok=True)
     os.chmod("secrets", 0o700)
+    lock = open(ACCOUNTS + ".lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)  # parallel helpers must never lose a password; released on exit
     data = json.load(open(ACCOUNTS)) if os.path.exists(ACCOUNTS) else {}
     if sub == "list":
         out([{"site": s, "email": v["email"], "url": v.get("url", ""), "created": v["created"]} for s, v in data.items()])
     if sub == "get" and len(a) > 2:
-        v = data.get(a[2])
-        out({"site": a[2], "email": v["email"], "url": v.get("url", ""), "created": v["created"],
-             "password_length": len(v["password"]), "file": ACCOUNTS} if v else {"error": f"no account for {a[2]}"},
+        site = slug(a[2])
+        v = data.get(site)
+        out({"site": site, "email": v["email"], "url": v.get("url", ""), "created": v["created"],
+             "password_length": len(v["password"]), "file": ACCOUNTS} if v else {"error": f"no account for {site}"},
             0 if v else 1)
     if sub == "new" and len(a) > 2:
-        site = re.sub(r"[^a-z0-9]+", "-", a[2].lower()).strip("-")
+        site, email = slug(a[2]), opt(a, "--email")
         if site in data:
+            if email and email != data[site]["email"]:
+                data[site]["email"] = email
+                save_accounts(data)
+                out({"site": site, "email": email, "updated": "email", "file": ACCOUNTS})
             out({"exists": site, "email": data[site]["email"], "file": ACCOUNTS})
-        email = opt(a, "--email")
         if not email:
             user = mail_user()
             if "@" not in user:
@@ -257,10 +298,7 @@ def cmd_acct(a):
         pw = "".join(secrets.choice(alphabet) for _ in range(14)) + secrets.choice("!#%*-_=+") + \
             secrets.choice(string.digits) + secrets.choice(string.ascii_uppercase) + secrets.choice(string.ascii_lowercase)
         data[site] = {"email": email, "password": pw, "url": opt(a, "--url", ""), "created": now()}
-        fd = os.open(ACCOUNTS + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(ACCOUNTS + ".tmp", ACCOUNTS)
+        save_accounts(data)
         out({"site": site, "email": email, "password_length": len(pw), "file": ACCOUNTS,
              "use": f"json.load(open('{ACCOUNTS}'))['{site}']['password'] inside your browser code; never print it"})
     out({"error": "usage: acct new SITE [--email E] [--url U] | acct list | acct get SITE"}, 2)
@@ -272,7 +310,11 @@ def main(a):
     if not a or a[0] not in cmds:
         print(__doc__)
         sys.exit(2)
-    cmds[a[0]](a)
+    check_flags(a)
+    try:
+        cmds[a[0]](a)
+    except ValueError as e:
+        out({"error": f"bad value: {e}"}, 2)
 
 
 if __name__ == "__main__":

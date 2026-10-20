@@ -28,15 +28,15 @@ Scripts: `python3 .autopilot/scripts/X.py`. One job per worker at a time, in its
     "<page text or mail id>"`. Close your tab.
 
 ## Questions you can't answer
-- **Unknown required field:** ask the owner once in a plain chat message (not a tool that pauses
-  the run), with the exact question and options. Add it under "Waiting on owner" in `STATE.md`
+- **Unknown required field:** ask the owner once in chat (as in `AGENTS.md`, Owner), with
+  the exact question and options. Add it under "Waiting on owner" in `STATE.md`
   (check there first; one question can serve many jobs), `track.py set ID WAITING --note "<question>"`,
   close the tab, move on. Never guess or pick a "close enough" option.
 - **Knockout questions** (years of experience, a tool, a licence): the true answer, even if it
   ends the application; then SKIPPED with the reason.
 - **Equality and diversity questions:** "Prefer not to say" unless `PROFILE.md` gives an answer.
-- **Salary:** the advertised figure or bottom of the range; else `PROFILE.md`; else ask. Match
-  the unit (annual, hourly, digits only).
+- **Salary:** the expectation in `PROFILE.md`. If the owner accepts advertised pay, use the advertised
+  figure or the bottom of the range; else ask. Match the unit (annual, hourly, digits only).
 - **Dates:** UK forms DD/MM/YYYY; Workday MM/YYYY spinners. Read the value back after typing.
 - **Phone:** with a separate country dropdown pick United Kingdom (+44) and enter `7xxx xxxxxx`
   (no leading 0); a single field takes `+44 7xxx xxxxxx` or `07xxx xxxxxx`.

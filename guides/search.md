@@ -13,7 +13,8 @@ From `TARGET.md` and the similar job's advert:
 - Keep the list in `TARGET.md`: add titles seen on real matches, drop queries that return noise.
 
 ## 2. Sources, best yield first
-1. **`jobs.py search --q "<title>" ... --where uk --days 7 --new`** gives public APIs, deduped
+1. **`jobs.py search --q "<title>" ... --where uk --days 7 --new`** (add `--remote` for remote-only
+   targets; title matches come first, description matches after) gives public APIs, deduped
    against the tracker. Run every title variant. `jobs.py board <ats> <company>` lists one
    employer's openings. Remote-board results lean US/worldwide: check UK eligibility.
 2. **UK job boards in the browser**, with a remote/work-from-home filter, the UK, sorted by date,
@@ -71,7 +72,7 @@ Apply in this order:
    then email routes.
 4. Closing date soonest.
 
-Search in bursts: apply until the queue drops below 10, then search again.
+Search in bursts: apply until the queue drops below 20, then search again.
 
 ## Customer-service example (UK, fully remote)
 - **Employers and BPOs** that advertise UK home-based customer-service roles:

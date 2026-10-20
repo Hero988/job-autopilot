@@ -63,14 +63,13 @@ command -v Xvfb >/dev/null && ok "Xvfb" || { miss "Xvfb"; need_apt="$need_apt xv
 command -v x11vnc >/dev/null && ok "x11vnc" || { miss "x11vnc"; need_apt="$need_apt x11vnc"; }
 command -v pdftotext >/dev/null && ok "pdftotext" || { miss "pdftotext"; need_apt="$need_apt poppler-utils"; }
 if [ -n "$need_apt" ] && [ -n "$SUDO" ] && command -v apt-get >/dev/null; then
-  echo "  installing:$need_apt"; $SUDO apt-get install -y -q $need_apt >/dev/null 2>&1 && MISSING=0
+  echo "  installing:$need_apt"; $SUDO apt-get install -y -q $need_apt >/dev/null 2>&1 && need_apt="" \
+    && echo "  installed; re-run setup.sh to re-check"
 fi
 [ -n "$need_apt" ] && [ -z "$SUDO" ] && echo "  -> ask the owner to run: sudo apt-get install -y$need_apt"
 if command -v websockify >/dev/null || [ -x .venv/bin/websockify ]; then ok "websockify"; else miss "websockify"; fi
 if [ -d /usr/share/novnc ] || [ -d "$HOME/.local/share/job-autopilot/novnc" ]; then ok "noVNC"; else
-  mkdir -p "$HOME/.local/share/job-autopilot" && curl -fsSL https://github.com/novnc/noVNC/archive/refs/tags/v1.5.0.tar.gz \
-    | tar -xz -C "$HOME/.local/share/job-autopilot" && mv "$HOME/.local/share/job-autopilot/noVNC-1.5.0" \
-    "$HOME/.local/share/job-autopilot/novnc" && ok "noVNC downloaded" || miss "noVNC"; fi
+  ok "noVNC (browser.py downloads it on the first share)"; fi
 if command -v cloudflared >/dev/null || [ -x "$HOME/.local/bin/cloudflared" ]; then ok "cloudflared"; else
   arch="$(uname -m)"; case "$arch" in x86_64) a=amd64;; aarch64|arm64) a=arm64;; *) a="$arch";; esac
   mkdir -p "$HOME/.local/bin" && curl -fsSL -o "$HOME/.local/bin/cloudflared" \

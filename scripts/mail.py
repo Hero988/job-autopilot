@@ -10,6 +10,8 @@ JSON on stdout. Never prints the password. Exit 0 ok, 1 error, 2 usage.
   python3 mail.py labels | mklabel NAME          list / create labels (nested with "/")
   python3 mail.py label ID.. [--add L].. [--remove L]..   add/remove labels (missing labels are created)
   python3 mail.py archive|trash|untrash|spam|read|unread|star|unstar ID..
+                                                 trash/spam refuse mail labelled Jobs/..., starred or important
+                                                 (--force only when the owner asked for that message to go)
   python3 mail.py delete ID.. --permanent        delete for ever (only messages already in Trash/Spam)
   python3 mail.py bounces [--hours 72]           delivery failures: failed recipient, reason, original subject
   python3 mail.py send --to X --subject S (--body TEXT | --body-file F) [--attach F].. [--cc X]
@@ -495,6 +497,19 @@ class Box:
                     self.expunge(x)
         return mid
 
+    def protected(self, mid):
+        """Why this message must not be trashed or marked spam (a Jobs/ label, starred, important), or ''."""
+        folder, u = self.locate(mid)
+        recs = self.fetch([u], body=None)
+        if not recs:
+            return ""
+        meta = recs[0]["meta"]
+        labels = gm_labels(meta) if self.gmail else [folder.replace(self.delim, "/")]
+        why = [l for l in labels if l.lower().startswith("jobs/") or l in ("\\Starred", "\\Important")]
+        if b"\\Flagged" in meta:
+            why.append("starred")
+        return ", ".join(dict.fromkeys(why))
+
     def act(self, verb, mid):
         """Returns the message's id afterwards (changes on non-Gmail servers when it moves folder)."""
         if verb in ("read", "unread", "star", "unstar"):
@@ -596,7 +611,7 @@ def send_message(to, subject, body, attachments=(), cc=None, reply_to_id=None, c
         return res
 
 
-def parse_args(argv, flags=("--permanent",)):
+def parse_args(argv, flags=("--permanent", "--force")):
     pos, opt, i = [], {}, 0
     while i < len(argv):
         if argv[i] in flags:
@@ -643,7 +658,7 @@ def main(argv):
         res = send_message(hdr(orig, "Reply-To") or hdr(orig, "From"), subj, full, opt.get("--attach", []), reply_to_id=pos[0], cfg=cfg)
         if os.path.isfile("JOURNAL.md"):
             with open("JOURNAL.md", "a", encoding="utf-8") as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M')} REPLY {pos[0]} approved: {approved}\n")
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime())} REPLY {pos[0]} approved: {approved}\n")
             res["journal"] = True
         out(res)
     with imap(cfg) as b:
@@ -695,6 +710,12 @@ def main(argv):
         if cmd == "label" and pos and (opt.get("--add") or opt.get("--remove")):
             out({"labelled": [{"id": i, "now": b.label(i, opt.get("--add", []), opt.get("--remove", []))} for i in pos],
                  "added": opt.get("--add", []), "removed": opt.get("--remove", [])})
+        if cmd in ("trash", "spam") and pos and "--force" not in opt:
+            for i in pos:
+                why = b.protected(i)
+                if why:
+                    out({"error": f"refused: {i} is protected ({why}). Application, interview, offer and starred mail "
+                                  "is kept. Use --force only if the owner asked for this message to go."}, 2)
         if cmd in ("archive", "trash", "untrash", "spam", "read", "unread", "star", "unstar") and pos:
             out({"action": cmd, "done": [{"id": i, "now": b.act(cmd, i)} for i in pos]})
         if cmd == "delete" and pos:

@@ -41,9 +41,7 @@ Unsure between two? Choose the one that needs more action and tell the owner.
 Interviews, assessments, deadlines and offers go to the owner **in chat at once**: employer, role,
 date, time and timezone, what is needed, and the Gmail `link`. Track open items under "Waiting on
 owner" in `STATE.md`. An offer is the campaign's goal: `track.py set ID OFFER`, tell the owner, stop
-applying until they answer. Optional phone ping (never print the topic; no links or secrets):
-
-    [ -s ~/.config/ntfy_topic_tt ] && curl -s -o /dev/null -d "Job agent: action needed, see chat" "https://ntfy.sh/$(cat ~/.config/ntfy_topic_tt)"
+applying until they answer. Ping the owner's phone as in `AGENTS.md` (Owner).
 
 ## Sending and replying
 You may send only:
