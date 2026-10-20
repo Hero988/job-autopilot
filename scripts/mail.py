@@ -12,7 +12,7 @@ JSON on stdout. Never prints the password. Exit 0 ok, 1 error, 2 usage.
   python3 mail.py labels | mklabel NAME          list / create labels (nested with "/")
   python3 mail.py label ID.. [--add L].. [--remove L]..   add/remove labels (missing labels are created)
   python3 mail.py archive|trash|untrash|spam|read|unread|star|unstar ID..
-                                                 trash/spam refuse mail labelled Jobs/..., starred or important
+                                                 trash/spam refuse mail labelled Jobs/... or Job Search/..., starred or important
                                                  (--force only when the owner asked for that message to go)
   python3 mail.py delete ID.. --permanent        delete for ever (only messages already in Trash/Spam)
   python3 mail.py bounces [--hours 72]           delivery failures: failed recipient, reason, original subject
@@ -58,6 +58,7 @@ CODE_HINT = re.compile(r"code|verif|otp|one[- ]time|passcode|\bpin\b|security", 
 BOUNCE_SUBJ = re.compile(r"undeliver|delivery status notification|failure notice|returned mail|delivery fail|"
                          r"could not be delivered|mail delivery failed|delivery has failed", re.I)
 HEADER_MSGID = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"
+JOB_LABEL = re.compile(r"jobs?( search)?(/|$)", re.I)  # Jobs/..., Job Search/...: application mail, never trashed
 socket.setdefaulttimeout(60)
 
 
@@ -514,7 +515,7 @@ class Box:
             return ""
         meta = recs[0]["meta"]
         labels = gm_labels(meta) if self.gmail else [folder.replace(self.delim, "/")]
-        why = [l for l in labels if l.lower().startswith("jobs/") or l in ("\\Starred", "\\Important")]
+        why = [l for l in labels if JOB_LABEL.match(l) or l in ("\\Starred", "\\Important")]
         if b"\\Flagged" in meta:
             why.append("starred")
         return ", ".join(dict.fromkeys(why))
@@ -711,7 +712,7 @@ class Api(Box):
         return [API_SYS.get(i) or self.names.get(i) for i in ids or [] if i in API_SYS or i in self.names]
 
     def summary(self, folder, rec):
-        msg, ids, full = rec["msg"], rec.get("labelIds") or [], "snippet" not in rec
+        msg, ids, full = rec["msg"], rec.get("labelIds") or [], "has_attachments" not in rec  # full = raw message
         t = int(rec.get("internalDate") or 0) / 1000 or time.time()
         try:
             date = parsedate_to_datetime(hdr(msg, "Date")).isoformat()
@@ -775,7 +776,7 @@ class Api(Box):
 
     def protected(self, mid):
         labels = self.names_of(self.get1(mid).get("labelIds"))
-        why = [l for l in labels if l.lower().startswith("jobs/") or l in ("\\Starred", "\\Important")]
+        why = [l for l in labels if JOB_LABEL.match(l) or l in ("\\Starred", "\\Important")]
         return ", ".join(dict.fromkeys(why + (["starred"] if "\\Starred" in labels else [])))
 
     def act(self, verb, mid):
