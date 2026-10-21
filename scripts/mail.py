@@ -5,14 +5,19 @@ JSON on stdout. Never prints the password. Exit 0 ok, 1 error, 2 usage.
 
   python3 mail.py check                          login works? capabilities, special folders, SMTP login (or Gmail API)
   python3 mail.py auth [CLIENT_SECRET.json]      Gmail API: sign in once in a browser, save the refresh token (setup.sh google)
-  python3 mail.py search "GMAIL QUERY" [--max 20]  e.g. 'newer_than:3d -label:autopilot/seen'
-  python3 mail.py show ID [--chars 4000]         headers, text body, links, codes, attachments, bounce info
-  python3 mail.py codes [--minutes 30] [--to X] [--from Y]   newest verification codes + verify/confirm links
+  python3 mail.py search "GMAIL QUERY" [--max 20] [--brief]   e.g. 'newer_than:3d -label:autopilot/seen'; "more": true = raise --max
+                                                 (--brief: one line per message: id, date, sender, subject)
+  python3 mail.py sweep [--since 3d|2h|EPOCH|ISO] [--max 100] [--all]   new mail in every folder incl. Spam (not Sent, Drafts,
+                                                 Trash), one line each with a class hint by keyword; skips autopilot/seen unless --all
+  python3 mail.py show ID.. [--chars 4000] [--full-links]   headers, text, links (text + URL minus tracking/sign-in parts), codes, attachments,
+                                                 bounce info; full URLs only with --full-links
+  python3 mail.py codes [--minutes 30] [--to ALIAS] [--from Y]   newest verification codes + verify/confirm links (all folders)
   python3 mail.py attachments ID [--out cv/]     save attachments; prints paths, sizes, sha256
   python3 mail.py labels | mklabel NAME          list / create labels (nested with "/")
   python3 mail.py label ID.. [--add L].. [--remove L]..   add/remove labels (missing labels are created)
   python3 mail.py archive|trash|untrash|spam|read|unread|star|unstar ID..
-                                                 trash/spam refuse mail labelled Jobs/... or Job Search/..., starred or important
+                                                 trash/spam refuse mail labelled Jobs/..., JobSearch/... or Job Search/... (except
+                                                 .../Alerts and .../Accounts), starred or important
                                                  (--force only when the owner asked for that message to go)
   python3 mail.py delete ID.. --permanent        delete for ever (only messages already in Trash/Spam)
   python3 mail.py bounces [--hours 72]           delivery failures: failed recipient, reason, original subject
@@ -26,8 +31,8 @@ JSON on stdout. Never prints the password. Exit 0 ok, 1 error, 2 usage.
 IDs are Gmail message ids in hex, as in Gmail web URLs (a full mail.google.com link is accepted too); "thread" is
 the Gmail thread id. On non-Gmail servers IDs are FOLDER:UID and labels are folders (labelling copies the message
 into that folder). Search takes Gmail query syntax; on non-Gmail servers a subset is translated: from: to: cc:
-subject: newer_than: older_than: after: before: is:unread/read/starred has:attachment label: in: -label:
-rfc822msgid: and plain words.
+subject: newer_than: older_than: after: before: (YYYY/MM/DD or epoch seconds) is:unread/read/starred has:attachment
+label: in: -label: rfc822msgid: {a b} or a OR b, and plain words. newer_than: m = months, as in Gmail; use h for hours.
 
 Config: ~/.config/job-autopilot/mail.env (mode 600), or the file named by $JOBS_MAIL_ENV:
   MAIL_USER=you@gmail.com   MAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx (spaces are stripped)
@@ -41,24 +46,45 @@ Python API: load_config(); `with imap() as b:` b.search(q, mx), b.show(id), b.la
   send_message(to, subject, body, attachments=(), cc=None, reply_to_id=None) -> dict.
 """
 import base64, email, email.policy, getpass, hashlib, html, http.client, http.server, imaplib, json, mimetypes, os, re, secrets
-import select, smtplib, socket, ssl, sys, threading, time, urllib.error, urllib.parse, urllib.request
+import random, select, smtplib, socket, ssl, sys, threading, time, urllib.error, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime
 from email.message import EmailMessage
-from email.utils import formataddr, formatdate, make_msgid, parsedate_to_datetime
+from email.utils import formataddr, formatdate, make_msgid, parseaddr, parsedate_to_datetime
 
 SPECIAL = ("All", "Trash", "Drafts", "Sent", "Junk", "Archive")
 FALLBACK = {"Trash": ["Trash", "Deleted Items", "Deleted Messages", "Bin"], "Drafts": ["Drafts"], "Junk": ["Junk", "Spam"],
             "Sent": ["Sent", "Sent Items", "Sent Messages"], "Archive": ["Archive"]}
 SYSTEM = {"inbox": "\\Inbox", "starred": "\\Starred", "important": "\\Important"}
 LINK_HINT = re.compile(r"verif|confirm|magic|token|login|log-in|signin|sign-in|invite|activat|auth|password|reset", re.I)
-CODE_RE = re.compile(r"(?<![\w#/.£$€-])(\d{4,8}|[A-Z0-9]{3,4}-[A-Z0-9]{3,4})(?![\w/%-]|\.\d)")
+CODE_RE = re.compile(r"(?<![\w#/.£$€@-])(\d{4,8}|\d{3} \d{3}|[A-Z0-9]{3,4}-[A-Z0-9]{3,4}|[A-Za-z0-9]{6,12})(?![\w/%@+-]|\.\d)")
 CODE_HINT = re.compile(r"code|verif|otp|one[- ]time|passcode|\bpin\b|security", re.I)
+ALNUM_HINT = re.compile(r"\b(codes?|verification|verify|otp|one[- ]time|passcode|security)\b", re.I)  # letters in codes: stricter
+NOT_CODE = re.compile(r"promo|discount|voucher|coupon|referr|reference|\bref\b|job code|requisition|order (no|number|id)|invoice|post ?code|zip", re.I)
+FOOTER = re.compile(r"©|\(c\)|copyright|unsubscribe|\b(LLC|Inc|Ltd|Limited|PLC|GmbH|Street|Avenue|Road|Floor|Suite|Parkway|"
+                    r"Boulevard|Blvd)\b", re.I)  # company footers and addresses: a code's line never has these
+URL_RE = re.compile(r"https?://[^\s<>\"')\]]+")
 BOUNCE_SUBJ = re.compile(r"undeliver|delivery status notification|failure notice|returned mail|delivery fail|"
                          r"could not be delivered|mail delivery failed|delivery has failed", re.I)
 HEADER_MSGID = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"
-JOB_LABEL = re.compile(r"jobs?( search)?(/|$)", re.I)  # Jobs/..., Job Search/...: application mail, never trashed
+JOB_LABEL = re.compile(r"(^|/)jobs?[ _-]?(search)?(/|$)", re.I)  # Jobs/, JobSearch/, Job Search/...: application mail, kept
+JOB_FREE = re.compile(r"/(alerts?|accounts?)$", re.I)  # ...except job alerts and used sign-up mail, which may go
+RATE_LIMIT = re.compile(r"rateLimitExceeded|userRateLimitExceeded|RESOURCE_EXHAUSTED|quota exceeded|too many requests", re.I)
+SWEEP_CLASSES = [(c, re.compile(r, re.I)) for c, r in [  # over sender, subject, snippet; first match wins; only a hint
+    ("bounce", BOUNCE_SUBJ.pattern + r"|mailer-daemon|postmaster"),
+    ("code", r"verification code|security code|one[- ]time (pass)?code|passcode|\botp\b|verify your (email|account)|"
+             r"confirm your (email|account)|activate your account|sign[- ]?in (code|link)|login code|reset your password"),
+    ("rejection", r"unfortunately|not (to )?(be )?progress|other candidates|unsuccessful|not been successful|regret to|"
+                  r"decided to (move forward|proceed|pursue) with|no longer (being )?considered|position has been filled"),
+    ("alert", r"job alert|jobs? for you|new jobs|recommended jobs|matching jobs|jobs you may|jobs? (digest|picks)|similar jobs"),
+    ("offer?", r"offer letter|pleased to offer|offer of employment|job offer|formal offer|verbal offer|contract of employment"),
+    ("interview", r"interview|schedule a (call|chat|time)|book a (call|time|slot)|your availability|phone screen|calendly"),
+    ("assessment", r"assessment|skills? test|hirevue|questionnaire|coding challenge|take-home|complete the (test|task)"),
+    ("ack", r"received your application|thanks? (you )?for (applying|your application|your interest)|application (received|"
+            r"submitted|confirmation)|successfully (applied|submitted)|we('ve| have) received"),
+]]
+
 socket.setdefaulttimeout(60)
 
 
@@ -108,11 +134,45 @@ def clean(text):
 
 
 def html_text(h):
-    links = re.findall(r"""href\s*=\s*["'](https?://[^"']+)""", h, re.I)
+    links = re.findall(r"""<a\b[^>]*?href\s*=\s*["'](https?://[^"']+)""", h, re.I)  # not <link> stylesheets
     h = re.sub(r"(?is)<(script|style|head)\b.*?</\1\s*>|<!--.*?-->", " ", h)
     h = re.sub(r"(?i)<br\s*/?>|</?(p|div|tr|li|ul|ol|h\d|table|section|header|footer)\b[^>]*>", "\n", h)
     h = re.sub(r"(?i)</t[dh]\s*>", " ", h)
     return html.unescape(re.sub(r"<[^>]+>", "", h)), [html.unescape(l) for l in links]
+
+
+def anchors(msg):
+    """{url: link text (or image alt text)} from the message's HTML parts."""
+    out = {}
+    for part in msg.walk():
+        if part.get_content_type() == "text/html" and not part.get_filename():
+            for u, t in re.findall(r"""<a\b[^>]*?href\s*=\s*["'](https?://[^"']+)["'][^>]*>(.*?)</a\s*>""", part_text(part), re.I | re.S):
+                alt = re.search(r"""alt\s*=\s*["']([^"']+)""", t, re.I)
+                name = clean(html.unescape(re.sub(r"<[^>]+>", " ", t))) or (html.unescape(alt.group(1)) if alt else "")
+                out.setdefault(html.unescape(u).rstrip(".,;"), " ".join(name.split())[:80])
+    return out
+
+
+# Query parameters dropped from shown links: tracking, and anything that may sign you in. Short ids that
+# name a job (?jk=, ?id=, ?gh_jid=) stay, so a job-alert email still shows one link per job.
+LINK_DROP = re.compile(r"utm_.*|_ga|_gl|gclid|fbclid|msclkid|mc_[ce]id|trk.*|tracking.*|ref.*|.*src|source|from|campaign|lever-.*|"
+                       r".*token.*|.*sig.*|.*auth.*|.*key.*|.*code.*|.*session.*|.*hash.*|e|u|email|user.*|login.*",
+                       re.I)
+
+
+def short_url(u):
+    """scheme://host/path (long paths cut) plus short job ids; "…" marks dropped tracking or sign-in parameters."""
+    p = urllib.parse.urlsplit(u)
+    path = p.path if len(p.path) <= 50 else p.path[:49] + "…"
+    pairs = urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+    keep = [(k, v) for k, v in pairs if not LINK_DROP.fullmatch(k) and len(v) <= 24][:3]
+    qs = urllib.parse.urlencode(keep)
+    more = "…" if len(keep) < len(pairs) or (p.query and not pairs) else ""
+    return f"{p.scheme}://{p.netloc}{path}" + (f"?{qs}{'&' if qs and more else ''}{more}" if qs or more else "")
+
+
+def shorten(text):
+    return URL_RE.sub(lambda mo: short_url(mo.group()), text)
 
 
 def parse(raw):
@@ -151,13 +211,31 @@ def text_of(msg):
             htm.append(t)
             links += l
     text = clean("\n".join(plain) if any(p.strip() for p in plain) else "\n".join(htm))
-    links += re.findall(r"https?://[^\s<>\"')\]]+", text)
+    links = links or URL_RE.findall(text)  # the plain part repeats the HTML links with other tracking ids
     return text, list(dict.fromkeys(l.rstrip(".,;") for l in links))
 
 
 def find_codes(text):
-    found = [mo.group(1) for mo in CODE_RE.finditer(text) if any(ch.isdigit() for ch in mo.group(1))
-             and not re.fullmatch(r"(19|20)\d\d", mo.group(1)) and CODE_HINT.search(text[max(0, mo.start() - 100):mo.end() + 30])]
+    """Codes near a hint word. Codes with letters need a stricter hint; letters-only ones must be mixed case and follow
+    "code:"/"code is", or stand alone on the line after a hinted line ending in ":" (Greenhouse 8-character codes)."""
+    text, found = URL_RE.sub(" ", text), []
+    for mo in CODE_RE.finditer(text):
+        c, a, b = mo.group(1), mo.start(1), mo.end(1)
+        line = text[text.rfind("\n", 0, a) + 1:(text.find("\n", b) + 1 or len(text) + 1) - 1]
+        if FOOTER.search(line):
+            continue
+        if re.fullmatch(r"[\d -]+", c) or "-" in c:
+            ok = any(ch.isdigit() for ch in c) and not re.fullmatch(r"(19|20)\d\d", c) and CODE_HINT.search(text[max(0, a - 100):b + 30])
+        else:
+            before = text[max(0, a - 200):a]
+            digits, mixed = any(ch.isdigit() for ch in c), any(ch.islower() for ch in c) and any(ch.isupper() for ch in c[1:])
+            labelled = re.search(r"(code|passcode|otp)\s*(is)?\s*[:\-]?\s*$", before, re.I)
+            word = re.fullmatch(r"\d+[A-Z]?[a-z]+|[A-Z]?[a-z]+\d+", c)  # micro1, 2026Hours: words glued to numbers
+            ok = (any(ch.isalpha() for ch in c) and (digits or mixed) and not word and not NOT_CODE.search(before[-40:])
+                  and (labelled or (ALNUM_HINT.search(before[-80:] if digits else before[-150:])
+                                    and (digits or (line.strip() == c and before.rstrip().endswith(":"))))))
+        if ok:
+            found.append(c)
     return list(dict.fromkeys(found))[:5]
 
 
@@ -205,6 +283,7 @@ def gm_labels(meta):
 
 class Box:
     """One logged-in IMAP connection. Gmail: UIDs in the \\All folder, ids = X-GM-MSGID hex. Others: FOLDER:UID."""
+    more = False  # set by search(): more messages matched than were returned
 
     def __init__(self, cfg):
         self.cfg, user, pw = cfg, cfg.get("MAIL_USER"), cfg.get("MAIL_APP_PASSWORD")
@@ -346,7 +425,7 @@ class Box:
         d = {"id": self.ident(folder, rec), "thread": None, "date": date, "from": hdr(msg, "From"), "to": hdr(msg, "To"),
              "subject": hdr(msg, "Subject"), "labels": gm_labels(meta) if self.gmail else [folder.replace(self.delim, "/")],
              "unread": "\\Seen" not in flags, "starred": "\\Flagged" in flags,
-             "snippet": re.sub(r"\s+", " ", text_of(msg)[0])[:200], "has_attachments": bool(atts_of(msg)),
+             "snippet": shorten(re.sub(r"\s+", " ", text_of(msg)[0]))[:200], "has_attachments": bool(atts_of(msg)),
              "_t": time.mktime(itime), "_mid": hdr(msg, "Message-ID")}
         if self.gmail:
             d["thread"] = format(int(re.search(rb"X-GM-THRID (\d+)", meta).group(1)), "x")
@@ -355,14 +434,25 @@ class Box:
 
     def search(self, query, mx=20):
         if self.gmail:  # X-GM-RAW searches the selected folder; trash and spam are not in All Mail
-            folder = self.special["All"]
+            kinds = ["All"]
             if re.search(r"(^|\s)in:(trash|bin)\b", query):
-                folder = self.special.get("Trash", folder)
+                kinds = ["Trash"]
             elif re.search(r"(^|\s)in:spam\b", query):
-                folder = self.special.get("Junk", folder)
-            self.select(folder)
-            uids = sorted(self.gm_search(query), key=int)[-mx:][::-1]
-            res = [self.summary(folder, r) for r in self.fetch(uids, "BODY.PEEK[]<0.300000>")]
+                kinds = ["Junk"]
+            elif re.search(r"(^|\s)in:anywhere\b", query):
+                kinds = ["All", "Junk"] + ([] if re.search(r"(^|\s)-in:(trash|bin)\b", query) else ["Trash"])
+            res, self.more = {}, False
+            for kind in kinds:
+                folder = self.special.get(kind) or self.special["All"]
+                self.select(folder)
+                uids = sorted(self.gm_search(query), key=int)
+                self.more |= len(uids) > mx
+                for r in self.fetch(uids[-mx:][::-1], "BODY.PEEK[]<0.300000>"):
+                    s = self.summary(folder, r)
+                    s["labels"] += {"Junk": ["\\Spam"], "Trash": ["\\Trash"]}.get(kind, [])
+                    res.setdefault(s["id"], s)
+            self.more |= len(res) > mx
+            res = sorted(res.values(), key=lambda s: -s["_t"])[:mx]
         else:
             res = self.plain_search(query, mx)
         for r in res:
@@ -371,8 +461,17 @@ class Box:
 
     def plain_search(self, query, mx):
         """Gmail query -> IMAP SEARCH over folders (labels); results deduped by Message-ID, newest first."""
-        crit, want, excl, after, has_att = [], None, [], 0, False
-        for neg, key, val in re.findall(r'(-?)(?:([a-z_]+):)?("[^"]*"|\S+)', query):
+        groups, want, excl, drop, after, until, has_att, start, alt = [], None, [], set(), 0, 2e10, False, None, False
+        fold = lambda cs: cs[0] if len(cs) == 1 else ["OR"] + cs[0] + fold(cs[1:])  # IMAP OR takes two keys
+        for brace, neg, key, val in re.findall(r'([{}])|(-?)(?:([a-z_]+):)?("[^"]*"|[^\s{}]+)', query):
+            if brace:  # {a b c} = a OR b OR c
+                if brace == "}" and start is not None and len(groups) > start:
+                    groups[start:] = [fold(groups[start:])]
+                start = len(groups) if brace == "{" else None
+                continue
+            if val == "OR" and not key and not neg:
+                alt = bool(groups)
+                continue
             val, key, c = val.strip('"'), key.lower(), []
             if key in ("from", "to", "cc", "subject"):
                 c = ["HEADER", key.capitalize(), q(val)]  # substring match everywhere (some servers' FROM is exact)
@@ -381,41 +480,57 @@ class Box:
                 when = time.time() - (int(mo.group(1)) * {"h": 3600, "d": 86400, "m": 2592000, "y": 31536000}[mo.group(2)] if mo else 86400)
                 c = ["SINCE" if key == "newer_than" else "BEFORE", time.strftime("%d-%b-%Y", time.localtime(when))]
                 after = max(after, when) if key == "newer_than" else after
-            elif key in ("after", "before"):
-                c = ["SINCE" if key == "after" else "BEFORE", datetime.strptime(val, "%Y/%m/%d").strftime("%d-%b-%Y")]
+            elif key in ("after", "before"):  # YYYY/MM/DD, YYYY-MM-DD or epoch seconds (exact, filtered below)
+                try:
+                    when = int(val) if val.isdigit() else datetime.strptime(val.replace("-", "/"), "%Y/%m/%d").timestamp()
+                except ValueError:
+                    raise MailError(f"bad date in {key}:{val} (use YYYY/MM/DD or epoch seconds)")
+                day = when + (86400 if key == "before" and val.isdigit() else 0)  # IMAP dates are whole days
+                c = ["SINCE" if key == "after" else "BEFORE", time.strftime("%d-%b-%Y", time.localtime(day))]
+                after, until = (max(after, when), until) if key == "after" else (after, min(until, when))
             elif key == "is":
                 c = [{"unread": "UNSEEN", "read": "SEEN", "starred": "FLAGGED"}.get(val, "ALL")]
             elif key == "has":
                 has_att = val == "attachment"
             elif key in ("label", "in"):
-                excl.append(val) if neg else None
-                want = want if neg else val
+                if neg and key == "in" and val.lower() in ("sent", "drafts", "draft", "trash", "bin", "spam"):
+                    drop.add(self.label_folder(val))
+                elif neg:
+                    excl.append(val)
+                else:
+                    want = val
             elif key == "rfc822msgid":
                 c = ["HEADER", "Message-ID", q(val)]
             else:
                 c = ["TEXT", q(val if not key else key + ":" + val)]
-            crit += ["NOT"] + c if neg and c else c
+            if c:
+                c = ["NOT"] + c if neg else c
+                groups[-1:] = [["OR"] + groups[-1] + c] if alt else groups[-1:] + [c]
+            alt = False
+        crit = [x for g in groups for x in g]
         if want and want != "anywhere":
             folders = [self.label_folder(want)]
         else:
             skip = {self.folder(k) for k in (("Drafts",) if want == "anywhere" else ("Trash", "Junk", "Drafts"))}
             folders = [f for f, fl in self.folders.items() if "\\Noselect" not in fl and f not in skip]
-        skip_mids = set()
+        skip_mids, res, self.more = set(), {}, False
         for f in [self.label_folder(l) for l in excl]:
             if f in self.folders:
                 self.select(f)
                 skip_mids |= {hdr(parse(r["body"]), "Message-ID") for r in self.fetch(self.uid_search("ALL"), HEADER_MSGID)}
-        res = {}
-        for f in [f for f in folders if f in self.folders]:
+        for f in [f for f in folders if f in self.folders and f not in drop]:
             self.select(f)
-            for r in self.fetch(self.uid_search(*(crit or ["ALL"]))[-mx * 3:], "BODY.PEEK[]<0.300000>"):
+            uids = self.uid_search(*(crit or ["ALL"]))
+            self.more |= len(uids) > mx * 3
+            for r in self.fetch(uids[-mx * 3:], "BODY.PEEK[]<0.300000>"):
                 s = self.summary(f, r)
-                if s["_t"] < after or (has_att and not s["has_attachments"]) or (s["_mid"] and s["_mid"] in skip_mids):
+                if not after <= s["_t"] < until or (has_att and not s["has_attachments"]) or (s["_mid"] and s["_mid"] in skip_mids):
                     continue
                 if (s["_mid"] or s["id"]) in res:
                     res[s["_mid"] or s["id"]]["labels"] += s["labels"]
                 else:
                     res[s["_mid"] or s["id"]] = s
+        self.more |= len(res) > mx
         return sorted(res.values(), key=lambda s: -s["_t"])[:mx]
 
     def message(self, mid):
@@ -426,16 +541,25 @@ class Box:
             raise MailError(f"message {mid} not found")
         return folder, recs[0], parse(recs[0]["body"])
 
-    def show(self, mid, chars=4000):
+    def show(self, mid, chars=4000, full_links=False):
         folder, rec, msg = self.message(mid)
         text, links = text_of(msg)
-        d = self.summary(folder, rec)
-        d.pop("_t"), d.pop("_mid")
+        d, names = self.summary(folder, rec), anchors(msg)
+        d.pop("_t"), d.pop("_mid"), d.pop("snippet")
+        codes = find_codes(d["subject"] + "\n" + text)
+        if not full_links:
+            text = shorten(text)
+            links = list({(names.get(l, ""), short_url(l)): 1 for l in links})  # deduped after shortening
+        else:
+            links = [(names.get(l, ""), l) for l in links]
+        rcpt = hdr(msg, "Delivered-To") or hdr(msg, "X-Original-To")
         d.update({"cc": hdr(msg, "Cc"), "reply_to": hdr(msg, "Reply-To"), "message_id": hdr(msg, "Message-ID"),
-                  "folder": folder, "text": text[:chars], "truncated": len(text) > chars, "links": links[:40],
-                  "codes": find_codes(d["subject"] + "\n" + text),
+                  "folder": folder, "text": text[:chars], "truncated": len(text) > chars,
+                  "links": [{"text": t, "url": u} for t, u in links[:40]], "codes": codes,
                   "attachments": [{"index": i, "name": p.get_filename() or f"part{i}", "type": p.get_content_type(),
                                    "size": len(p.get_payload(decode=True) or b"")} for i, p in enumerate(atts_of(msg))]})
+        if rcpt and rcpt.lower() not in (d["to"] + d["cc"]).lower():
+            d["delivered_to"] = rcpt
         if is_bounce(msg):
             d["bounce"] = bounce_info(msg)
         return d
@@ -515,7 +639,7 @@ class Box:
             return ""
         meta = recs[0]["meta"]
         labels = gm_labels(meta) if self.gmail else [folder.replace(self.delim, "/")]
-        why = [l for l in labels if JOB_LABEL.match(l) or l in ("\\Starred", "\\Important")]
+        why = [l for l in labels if (JOB_LABEL.search(l) and not JOB_FREE.search(l)) or l in ("\\Starred", "\\Important")]
         if b"\\Flagged" in meta:
             why.append("starred")
         return ", ".join(dict.fromkeys(why))
@@ -651,12 +775,26 @@ class Api(Box):
 
     def req(self, method, path, body=None, **query):
         url = self.base + path + ("?" + urllib.parse.urlencode(query, doseq=True) if query else "")
-        for retry in (False, True):  # one retry with a fresh token after 401
-            status, res = http_json(url, None if body is None else json.dumps(body).encode(),
-                                    {"Authorization": "Bearer " + self.token(retry), "Content-Type": "application/json"}, method)
-            if status != 401:
+        # A fresh token once after 401. Back off 2-4-8-16-32 s on rate limits (the per-user quota is shared by every
+        # helper), and on 5xx or a dropped connection unless resending could duplicate a send or draft.
+        fresh = renew = False
+        again = method != "POST" or path.endswith(("/modify", "/trash", "/untrash"))
+        for attempt in range(6):
+            auth = "Bearer " + self.token(renew)  # outside the try: an expired sign-in fails at once, not after retries
+            try:
+                status, res = http_json(url, None if body is None else json.dumps(body).encode(),
+                                        {"Authorization": auth, "Content-Type": "application/json"}, method)
+            except (OSError, MailError) as e:
+                status, res = 0, {"_text": f"connection failed: {type(e).__name__}: {e}"}
+            renew = False
+            if status == 401 and not fresh:
+                fresh = renew = True
+                continue
+            limited = status == 429 or (status == 403 and RATE_LIMIT.search(json.dumps(res)))
+            if attempt == 5 or not (limited or (again and (status == 0 or status >= 500))):
                 break
-        if status >= 400:
+            time.sleep(2 ** (attempt + 1) + random.random())
+        if status >= 400 or status == 0:
             err = res.get("error") if isinstance(res.get("error"), dict) else {}
             msg = err.get("message") or res.get("_text") or str(res)[:200]
             hint = "; enable the Gmail API in the Cloud project (setup.sh google, step 3)" if "has not been used" in msg or "disabled" in msg else ""
@@ -720,7 +858,7 @@ class Api(Box):
             date = datetime.fromtimestamp(t).isoformat()
         return {"id": rec["id"], "thread": rec.get("threadId"), "date": date, "from": hdr(msg, "From"), "to": hdr(msg, "To"),
                 "subject": hdr(msg, "Subject"), "labels": self.names_of(ids), "unread": "UNREAD" in ids, "starred": "STARRED" in ids,
-                "snippet": re.sub(r"\s+", " ", text_of(msg)[0] if full else html.unescape(rec["snippet"]))[:200],
+                "snippet": shorten(re.sub(r"\s+", " ", text_of(msg)[0] if full else html.unescape(rec["snippet"])))[:200],
                 "has_attachments": bool(atts_of(msg)) if full else rec["has_attachments"],
                 "_t": t, "_mid": hdr(msg, "Message-ID"), "link": GMAIL_LINK + rec["id"]}
 
@@ -751,8 +889,9 @@ class Api(Box):
             ids, page = ids + [m["id"] for m in r.get("messages", [])], r.get("nextPageToken")
             if not page or not r.get("messages"):
                 break
+        self.more = bool(page)
         self.token()
-        with ThreadPoolExecutor(8) as pool:  # Gmail allows ~50 message reads a second per user
+        with ThreadPoolExecutor(4) as pool:  # the per-user quota (~50 reads a second) is shared by every helper
             recs = list(pool.map(self.meta, ids))
         for e in recs:
             if isinstance(e, Exception):
@@ -776,7 +915,7 @@ class Api(Box):
 
     def protected(self, mid):
         labels = self.names_of(self.get1(mid).get("labelIds"))
-        why = [l for l in labels if JOB_LABEL.match(l) or l in ("\\Starred", "\\Important")]
+        why = [l for l in labels if (JOB_LABEL.search(l) and not JOB_FREE.search(l)) or l in ("\\Starred", "\\Important")]
         return ", ".join(dict.fromkeys(why + (["starred"] if "\\Starred" in labels else [])))
 
     def act(self, verb, mid):
@@ -950,7 +1089,41 @@ def send_message(to, subject, body, attachments=(), cc=None, reply_to_id=None, c
         return res
 
 
-def parse_args(argv, flags=("--permanent", "--force")):
+def when_of(s):
+    try:
+        return datetime.fromisoformat(s["date"]).timestamp()
+    except (ValueError, TypeError):
+        return time.time()  # unreadable Date header: treat as new
+
+
+def since_of(v):
+    mo = re.fullmatch(r"(\d+)([hd])", v)
+    if mo:
+        return time.time() - int(mo.group(1)) * (3600 if mo.group(2) == "h" else 86400)
+    try:
+        return int(v) if v.isdigit() else datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        raise MailError("--since takes 3d, 2h, epoch seconds or an ISO time like 2026-10-21T09:00")
+
+
+def classify(s):
+    text = " ".join((s["from"], s["subject"], s.get("snippet", "")))
+    return next((c for c, rx in SWEEP_CLASSES if rx.search(text)), "other")
+
+
+def brief(s, cls=None):
+    """One line: id, local date, sender (name <domain>), [class,] subject, [spam]/[trash]."""
+    name, addr = parseaddr(s["from"])
+    who = (name or addr)[:30] + (f" <{addr.split('@')[-1]}>" if name and "@" in addr else "")
+    try:
+        when = datetime.fromisoformat(s["date"]).astimezone().strftime("%m-%d %H:%M")
+    except (ValueError, TypeError):
+        when = str(s["date"])[:16]
+    where = "".join(f" [{w}]" for w, l in (("spam", "\\Spam"), ("trash", "\\Trash")) if l in s["labels"])
+    return f"{s['id']} {when} " + (f"{cls:<10} " if cls else "") + f"{who} | {' '.join(s['subject'].split())[:100]}{where}"
+
+
+def parse_args(argv, flags=("--permanent", "--force", "--full-links", "--brief", "--all")):
     pos, opt, i = [], {}, 0
     while i < len(argv):
         if argv[i] in flags:
@@ -964,7 +1137,7 @@ def parse_args(argv, flags=("--permanent", "--force")):
     return pos, opt
 
 
-CMDS = ("auth check search show codes attachments labels mklabel label archive trash untrash spam read unread star unstar "
+CMDS = ("auth check search sweep show codes attachments labels mklabel label archive trash untrash spam read unread star unstar "
         "delete bounces send reply draft").split()
 
 
@@ -1021,17 +1194,29 @@ def main(argv):
             out(res)
         if cmd == "search" and pos:
             res = b.search(pos[0], int(one("--max", 20)))
-            out({"count": len(res), "messages": res})
+            out({"count": len(res), "more": b.more, "messages": [brief(s) for s in res] if "--brief" in opt else res})
+        if cmd == "sweep":  # a listing to triage, not a decision: open anything unclear with show
+            since = since_of(one("--since", "3d"))
+            query = (f"in:anywhere newer_than:{max(1, -(-int(time.time() - since) // 3600))}h -in:sent -in:drafts -in:trash"
+                     + ("" if "--all" in opt else " -label:autopilot/seen"))
+            res = [s for s in b.search(query, int(one("--max", 100))) if when_of(s) >= since]
+            out({"since": datetime.fromtimestamp(since).astimezone().isoformat(timespec="minutes"), "count": len(res),
+                 "more": b.more, "messages": [brief(s, classify(s)) for s in res]})
         if cmd == "show" and pos:
-            out(b.show(pos[0], int(one("--chars", 4000))))
-        if cmd == "codes":
-            mins = int(one("--minutes", 30))
-            query = f"newer_than:{max(1, -(-mins // 60))}h" + "".join(f" {k}:{one('--' + k)}" for k in ("to", "from") if one("--" + k))
+            res = [b.show(i, int(one("--chars", 4000)), "--full-links" in opt) for i in pos]
+            out(res[0] if len(res) == 1 else {"count": len(res), "messages": res})
+        if cmd == "codes":  # all folders (codes land in Spam too); --to keeps one helper to its own alias
+            mins, alias = int(one("--minutes", 30)), (one("--to") or "").lower()
+            query = f"in:anywhere newer_than:{max(1, -(-mins // 60))}h" + "".join(f" {k}:{one('--' + k)}" for k in ("to", "from") if one("--" + k))
             res = []
             for s in b.search(query, 30):
-                d = b.show(s["id"], 20000)
-                links = [l for l in d["links"] if LINK_HINT.search(l)][:5]
-                if (d["codes"] or links) and datetime.fromisoformat(d["date"]).timestamp() >= time.time() - mins * 60:
+                if when_of(s) < time.time() - mins * 60:
+                    continue
+                d = b.show(s["id"], 20000, full_links=True)
+                if alias and alias not in " ".join((d["to"], d["cc"], d.get("delivered_to", ""))).lower():
+                    continue
+                links = [x["url"] for x in d["links"] if LINK_HINT.search(x["url"] + " " + x["text"])][:5]
+                if d["codes"] or links:
                     res.append(dict({k: d[k] for k in ("id", "date", "from", "to", "subject", "codes")}, links=links))
             out({"count": len(res), "messages": res[:10]})
         if cmd == "attachments" and pos:

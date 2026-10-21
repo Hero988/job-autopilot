@@ -3,34 +3,39 @@
 Python 3.8+, standard library only for the CLI; the importable helpers need Playwright.
 
 Chrome runs on a virtual display (Xvfb, plus openbox if installed) and keeps its profile (logins)
-in ~/.local/state/job-autopilot/chrome-profile. Agents connect over CDP; the owner can see and
+in ~/.local/state/job-autopilot/chrome-profile. Closing the last tab does not quit it; after an
+unexpected exit, the next start/connect relaunches it with the last tabs (new ids) and says so on stderr. Agents connect over CDP; the owner can see and
 control the same browser from any PC through `share`. Prints JSON; never prints cookies, and the VNC
 password only inside the share URL (which goes to the owner in chat, never into a file).
 
   python3 browser.py start                 start Xvfb + Chrome if not running (idempotent, detached)
-  python3 browser.py status                running?, tabs, share active + expiry
+  python3 browser.py status                running?, tabs, Chrome start time, restarts, share + expiry
   python3 browser.py tabs                  list tabs: id, title, url (no query string)
   python3 browser.py close ID [ID..]       close tabs by id
   python3 browser.py close --all           close every tab, leaving one about:blank
   python3 browser.py stop                  stop share, Chrome (gracefully), window manager, Xvfb
   python3 browser.py share [--minutes 60]  remote view+control link (noVNC over a cloudflared quick
                                            tunnel); auto-unshares after --minutes; same link if active
-  python3 browser.py unshare               stop x11vnc, websockify, cloudflared
+  python3 browser.py unshare               stop x11vnc, websockify, cloudflared (also strays of ours)
 
 Env: JOBS_DISPLAY (:77) JOBS_CDP_PORT (9333) JOBS_VNC_PORT (5977) JOBS_WS_PORT (6077)
+     JOBS_STATE_DIR (~/.local/state/job-autopilot)
 
 Python helpers (agent code):
   sys.path.insert(0, ".autopilot/scripts"); import browser
-  browser.connect(playwright) -> (browser, context)    starts Chrome if needed; context = the profile
+  browser.connect(playwright, timeout=30000) -> (b, context)   starts Chrome if needed; context = the
+                                                       profile; Fail listing the tabs if a hung tab blocks it
   browser.new_tab(context, url, background=True) -> Page   new tab that does not steal focus
   browser.handoff_tab(context, url_or_page) -> Page    URL: own new window, in front, for the owner;
                                                        Page: activated and raised where it is (state kept)
-  Disconnect with browser.close() (disconnects only; Chrome keeps running). Close only your own tabs.
+  browser.target_id(context, page) -> id               save it: every script is a new process
+  browser.find_tab(context, id) -> Page or None        your tab again, by id (never pick tabs by URL)
+  Disconnect with b.close() (disconnects only; Chrome keeps running). Close only your own tabs.
 """
-import contextlib, io, json, os, re, secrets, shutil, signal, socket, string, subprocess, sys, tarfile, time
+import contextlib, fcntl, io, json, os, re, secrets, shutil, signal, socket, string, subprocess, sys, tarfile, time
 import urllib.error, urllib.request
 
-STATE = os.path.expanduser("~/.local/state/job-autopilot")
+STATE = os.path.abspath(os.path.expanduser(os.environ.get("JOBS_STATE_DIR") or "~/.local/state/job-autopilot"))
 PROFILE, LOGS = os.path.join(STATE, "chrome-profile"), os.path.join(STATE, "logs")
 BJSON, SJSON, PWFILE = (os.path.join(STATE, n) for n in ("browser.json", "share.json", "vncpass"))
 DISPLAY = os.environ.get("JOBS_DISPLAY", ":77")
@@ -108,6 +113,18 @@ def alive(pid, name):
     return state != "Z" and name.encode() in cmd
 
 
+def proc_start(pid):
+    """Start time (epoch) of a running process, from /proc; None if unknown."""
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/stat") as f:
+            boot = next(int(l.split()[1]) for l in f if l.startswith("btime "))
+    except (OSError, TypeError, ValueError, IndexError, StopIteration):
+        return None
+    return boot + ticks / os.sysconf("SC_CLK_TCK")
+
+
 def kill(pid, name, wait=10):
     if pid == os.getpid() or not alive(pid, name):
         return False
@@ -181,7 +198,7 @@ def lock_pid():
 
 
 def start():
-    st = load(BJSON)
+    st, launched = load(BJSON), None
     if not cdp_ok():
         os.makedirs(LOGS, mode=0o700, exist_ok=True)
         os.chmod(STATE, 0o700), os.chmod(LOGS, 0o700)
@@ -194,11 +211,13 @@ def start():
             private(os.path.join(STATE, "openbox-rc.xml"), OPENBOX_RC)
             st["wm_pid"] = spawn(["openbox", "--config-file", os.path.join(STATE, "openbox-rc.xml")],
                                  "openbox.log", env=env)
+        save(BJSON, st)  # so stop can clean up even if the Chrome launch below fails
         pid = lock_pid()
         if pid > 0 and alive(pid, "chrom"):  # running (maybe still starting) on our profile
             if not until(cdp_ok, 15):
                 raise Fail(f"Chrome pid {pid} holds the profile but CDP port {PORT} does not answer; run stop")
         else:  # no lock, or a stale one left by a crash: clear it, then launch
+            unclean = bool(st.get("pid"))  # browser.json survives every exit except `stop`
             rm(*(os.path.join(PROFILE, "Singleton" + n) for n in ("Lock", "Socket", "Cookie")))
             exe = tool("google-chrome") or tool("google-chrome-stable") or tool("chromium")
             if not exe:
@@ -208,13 +227,25 @@ def start():
                                "--password-store=basic", "--ozone-platform=x11", f"--window-size={W},{H}",
                                "--window-position=0,0", "--start-maximized", "--hide-crash-restore-bubble",
                                "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
-                               "--disable-backgrounding-occluded-windows", "about:blank"], "chrome.log", env=env)
+                               "--disable-backgrounding-occluded-windows",
+                               "--keep-alive-for-test",  # closing the last tab or window must not quit Chrome
+                               "--restore-last-session" if unclean else "about:blank"], "chrome.log", env=env)
             if not until(cdp_ok, 30):
                 raise Fail(f"Chrome did not open CDP on {PORT}; see {LOGS}/chrome.log")
-            st["started"] = iso(time.time())
+            st["started"], launched = iso(time.time()), ("restarted" if unclean else "new")
+            if unclean:
+                st.update(restarts=st.get("restarts", 0) + 1, last_restart=st["started"])
         st.update(pid=lock_pid() if lock_pid() > 0 else st.get("pid"), display=DISPLAY, cdp=CDP)
         save(BJSON, st)
-    return {"cdp": CDP, "display": DISPLAY, "tabs": len(pages()), "pid": st.get("pid")}
+    res = {"cdp": CDP, "display": DISPLAY, "tabs": len(pages()), "pid": st.get("pid")}
+    if launched:
+        res["launched"] = launched
+        res["note"] = ("Chrome had stopped unexpectedly and was started again with its last tabs reopened under NEW "
+                       "ids (forms may be empty). Saved tab ids are void: find your tab again, and if you had "
+                       "clicked Submit, look for proof before redoing it." if unclean else
+                       "Chrome was not running; started a new one (no tabs).")
+        print("browser.py: " + res["note"], file=sys.stderr)
+    return res
 
 
 def share_alive(sh):
@@ -224,9 +255,12 @@ def share_alive(sh):
 
 def status():
     st, sh, up = load(BJSON), load(SJSON), cdp_ok()
-    on = share_alive(sh)
-    return {"running": up, "cdp": CDP, "display": DISPLAY, "pid": st.get("pid") if up else None,
-            "tabs": len(pages()) if up else 0, "share": {"active": on, "expires": sh.get("expires") if on else None}}
+    on, pid = share_alive(sh), (lock_pid() if lock_pid() > 0 else st.get("pid"))
+    t = proc_start(pid) if up and alive(pid, "chrom") else None
+    return {"running": up, "cdp": CDP, "display": DISPLAY, "pid": pid if up else None,
+            "started": iso(t) if t else (st.get("started") if up else None), "tabs": len(pages()) if up else 0,
+            "restarts": st.get("restarts", 0), "last_restart": st.get("last_restart"),
+            "share": {"active": on, "expires": sh.get("expires") if on else None}}
 
 
 def close(ids, all_tabs=False):
@@ -285,6 +319,18 @@ def tunnel_url(pid):
 
 
 def share(minutes):
+    """One share at a time: a second call waits for the first and returns its link."""
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    with os.fdopen(os.open(os.path.join(STATE, "share.lock"), os.O_WRONLY | os.O_CREAT, 0o600), "w") as lk:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("browser.py: another share call is creating the link; waiting for it", file=sys.stderr)
+            fcntl.flock(lk, fcntl.LOCK_EX)
+        return _share(minutes)
+
+
+def _share(minutes):
     sh = load(SJSON)
     if share_alive(sh):
         return {"url": sh["url"], "expires": sh["expires"], "note": "already shared; unshare first for a new expiry"}
@@ -302,19 +348,23 @@ def share(minutes):
     pw = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8))  # VNC max is 8
     private(PWFILE, pw + "\n")  # x11vnc deletes it after reading ("rm:")
     sh = {"started": iso(time.time())}
+    save(SJSON, sh)  # saved now and after every spawn, so unshare can stop what an interrupted call started
     try:
         sh["x11vnc"] = spawn([exe["x11vnc"], "-display", DISPLAY, "-rfbport", str(VNC), "-localhost", "-passwdfile",
                               "rm:" + PWFILE, "-shared", "-forever", "-noxdamage", "-quiet"], "x11vnc.log")
+        save(SJSON, sh)
         if not until(lambda: reach(VNC), 15):
             raise Fail(f"x11vnc did not start; see {LOGS}/x11vnc.log")
         sh["websockify"] = spawn([exe["websockify"], "--web", web, f"127.0.0.1:{WS}", f"127.0.0.1:{VNC}"],
                                  "websockify.log")
+        save(SJSON, sh)
         if not until(lambda: reach(WS), 15):
             raise Fail(f"websockify did not start; see {LOGS}/websockify.log")
         empty = os.path.join(STATE, "cloudflared-empty.yml")  # ignore any named-tunnel config on this machine
         private(empty, "")
         sh["cloudflared"] = spawn([exe["cloudflared"], "tunnel", "--config", empty, "--no-autoupdate", "--url",
                                    f"http://127.0.0.1:{WS}"], "cloudflared.log", mode="wb")
+        save(SJSON, sh)
         until(lambda: tunnel_url(sh["cloudflared"]) != "", 60, 0.5)
         base = tunnel_url(sh["cloudflared"])
         if not base:
@@ -324,7 +374,7 @@ def share(minutes):
     except BaseException:
         for k, n in SHARE_PROCS[1:]:
             kill(sh.get(k), n)
-        rm(PWFILE)
+        rm(SJSON, PWFILE)
         raise
     exp = time.time() + minutes * 60
     sh.update(url=f"{base}/vnc.html?autoconnect=1&resize=scale&password={pw}", expires=iso(exp), expires_ts=exp)
@@ -334,9 +384,33 @@ def share(minutes):
     return {"url": sh["url"], "expires": sh["expires"]}
 
 
+def strays():
+    """(pid, name) of share processes of THIS state dir and these ports that share.json no longer lists (left by
+    an interrupted share). Matched on exact arguments, never on substrings, so nothing unrelated is touched."""
+    found, me = [], os.getuid()
+    for d in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            if os.stat(f"/proc/{d}").st_uid != me:
+                continue
+            with open(f"/proc/{d}/cmdline", "rb") as f:
+                argv = f.read().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        names = [os.path.basename(a) for a in argv[:2]]  # websockify may run as "python3 .../websockify"
+        pairs = set(zip(argv, argv[1:]))
+        if "cloudflared" == names[0] and ("--config", os.path.join(STATE, "cloudflared-empty.yml")) in pairs:
+            found.append((int(d), "cloudflared"))
+        elif "x11vnc" == names[0] and {("-display", DISPLAY), ("-rfbport", str(VNC))} <= pairs:
+            found.append((int(d), "x11vnc"))
+        elif "websockify" in names and (f"127.0.0.1:{WS}", f"127.0.0.1:{VNC}") in pairs:
+            found.append((int(d), "websockify"))
+    return found
+
+
 def unshare():
     sh = load(SJSON)
     stopped = [k for k, n in SHARE_PROCS if kill(sh.get(k), n)]
+    stopped += [f"stray {n}" for pid, n in strays() if kill(pid, n)]
     rm(SJSON, PWFILE)
     return {"unshared": True, "stopped": stopped}
 
@@ -353,20 +427,50 @@ def watchdog():
 
 # ---- Playwright helpers (Playwright is only imported by the caller) ----
 
-def connect(playwright):
-    """(browser, context) on the shared Chrome. Finish with browser.close(): disconnects, Chrome stays up."""
+def connect(playwright, timeout=30000):
+    """(b, context) on the shared Chrome. Finish with b.close(): disconnects, Chrome stays up. timeout in ms;
+    a hung tab (frozen page, open dialog) blocks every attach, so on timeout this raises Fail listing the tabs."""
     if not cdp_ok():
-        start()
-    b = playwright.chromium.connect_over_cdp(CDP)
+        start()  # prints a notice on stderr if it had to (re)launch Chrome
+    try:
+        b = playwright.chromium.connect_over_cdp(CDP, timeout=timeout)
+    except Exception as e:
+        if "Timeout" not in type(e).__name__ and "Timeout" not in str(e):
+            raise
+        try:
+            tabs = "\n".join(f'  {t["id"]}  {t.get("title", "")[:60]!r}  {re.split(r"[?#]", t.get("url", ""))[0]}'
+                             for t in pages())
+        except Fail as f:
+            tabs = "  (" + str(f) + ")"
+        raise Fail(f"Could not attach to Chrome within {timeout // 1000}s: a tab is probably hung (frozen page or "
+                   f"open dialog) and blocks every agent. Tabs:\n{tabs}\nIf the hung one is yours: "
+                   "python3 browser.py close ID (works on frozen tabs). Otherwise tell the lead.") from None
     return b, b.contexts[0]
 
 
-def _target_id(context, page):
+def target_id(context, page):
+    """The tab's id (as in `browser.py tabs`). Save it: it finds your tab again from a later script."""
     s = context.new_cdp_session(page)
     try:
         return s.send("Target.getTargetInfo")["targetInfo"]["targetId"]
     finally:
         s.detach()
+
+
+def find_tab(context, tid):
+    """Your tab's Page by id, or None if it is gone (closed, or Chrome restarted). Never pick tabs by URL:
+    other agents' tabs on the same site match too."""
+    url = next((t.get("url") for t in pages() if t["id"] == tid), None)
+    if url is None:
+        return None
+    for p in sorted(context.pages, key=lambda p: p.url != url):  # same URL first: usually one CDP call
+        with contextlib.suppress(Exception):  # a tab closing meanwhile
+            if target_id(context, p) == tid:
+                return p
+    return None
+
+
+_target_id = target_id  # old private name, still used by some campaign scripts
 
 
 def _open(context, url, **opts):
@@ -376,7 +480,7 @@ def _open(context, url, **opts):
     while time.time() < end:
         for p in [p for p in context.pages if p not in seen]:
             seen.add(p)
-            if _target_id(context, p) == tid:  # other agents' new tabs show up here too
+            if target_id(context, p) == tid:  # other agents' new tabs show up here too
                 return p, cdp, tid
         with contextlib.suppress(Exception):
             context.wait_for_event("page", timeout=300)
@@ -398,7 +502,7 @@ def handoff_tab(context, url_or_page):
         page, cdp, tid = _open(context, url_or_page, newWindow=True)
     else:
         page, cdp = url_or_page, context.browser.new_browser_cdp_session()
-        tid = _target_id(context, page)
+        tid = target_id(context, page)
     try:
         win = cdp.send("Browser.getWindowForTarget", {"targetId": tid})["windowId"]
         for b in ({"left": 0, "top": 0, "width": W, "height": H}, {"windowState": "maximized"}):
@@ -427,7 +531,7 @@ def main(a):
     if cmd in ("start", "status", "stop", "unshare"):
         out(globals()[cmd]())
     print(__doc__)
-    sys.exit(2)
+    sys.exit(0 if cmd in ("-h", "--help", "help") else 2)
 
 
 if __name__ == "__main__":

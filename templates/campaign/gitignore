@@ -2,5 +2,8 @@ secrets/
 .venv/
 cv/
 evidence/
+work/
+__pycache__/
+*.pyc
 *.lock
 *.tmp

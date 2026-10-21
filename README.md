@@ -11,7 +11,10 @@ want, a similar job (a link, or "find it in my email"), and your CV. It then:
   available: labels, archives, trashes junk,
   reads codes, spots interviews, rejections and bounces. It never replies without your approval;
 - **asks you** in your agent's chat only for what only you can do (an unknown fact, a CAPTCHA, an SMS
-  code, approval of a reply), and keeps working while it waits;
+  code, approval of a reply), in batches, and keeps working while it waits. CAPTCHAs are collected
+  and offered as one session;
+- **keeps your to-do list** in `OWNER.md`, one line per item. Interviews, assessments and video
+  stages each get a step-by-step `next-steps/` file;
 - **lets you into its browser from any computer**: `browser.py share` prints a temporary https link
   (noVNC over a Cloudflare tunnel) for CAPTCHAs and sign-ins;
 - **stops only when an email offers you a job**, and tells you at once.
@@ -32,10 +35,15 @@ OpenCode, Copilot CLI, T3 Code), and in Claude Code through `CLAUDE.md` → `@AG
    [`GOAL.md`](GOAL.md) with your three lines filled in. The agent clones this repo into `.autopilot/`,
    runs `setup.sh`, and takes it from there.
 
-**Answering the agent:** reply in the chat; your harness may let you message it while it works. For
-a CAPTCHA, open the link it sends (from any computer), solve the check, and reply "done". Optional:
-put an [ntfy](https://ntfy.sh) topic in `~/.config/ntfy_topic_tt` and subscribe to it on your phone
-to get a ping whenever it needs you.
+**Answering the agent:** reply in the chat; your harness may let you message it while it works. The
+first run asks one batch of questions (title, declarations, equipment, tools, whether it may tick
+sites' standard terms, and whether it may retitle your CV for each role). Answer them all and it
+rarely needs you again. For CAPTCHAs, open the link it sends (from any computer), work through the
+list, and reply "done". Ask "what do I need to do?" at any time to get `OWNER.md`. Optional:
+- put an [ntfy](https://ntfy.sh) topic in `~/.config/ntfy_topic_tt` and subscribe to it on your
+  phone for a ping whenever it needs you;
+- add free [Reed](https://www.reed.co.uk/developers) or [Adzuna](https://developer.adzuna.com) API
+  keys to `~/.config/job-autopilot/jobs.env` (`REED_API_KEY=...`) for more job sources.
 
 ## What's here
 | Path | What |
@@ -43,20 +51,22 @@ to get a ping whenever it needs you.
 | `templates/campaign/AGENTS.md` | **The method**: boundaries, first run, the loop, owner asks, the offer stop, resume. Copied into each campaign. |
 | `GOAL.md` | The prompt to paste. |
 | `guides/` | `search.md` (finding jobs), `applying.md` (forms, accounts, ATS tips), `email.md` (mailbox rules), `browser.md` (the shared Chrome and the remote link), `gmail-api.md` (connecting Gmail without an app password). |
-| `templates/campaign/` | Campaign files: `STATE.md`, `JOURNAL.md`, `TARGET.md`, `PROFILE.md`, `applications.csv`. |
-| `scripts/browser.py` | One local Chrome (Xvfb + CDP) shared by the agent and its helpers; `share` gives the remote link. |
-| `scripts/mail.py` | Full mailbox management: search, show, codes, attachments, labels, archive, trash, send (new mail only), guarded reply, drafts, bounces. IMAP/SMTP with an app password, or the Gmail API with OAuth (`mail.py auth`). |
-| `scripts/jobs.py` | Searches public job APIs and company ATS boards (Greenhouse, Lever, Ashby…), and hides jobs already tracked. |
-| `scripts/track.py` | The application tracker (locked, so helpers can run in parallel) and site accounts with generated passwords. |
+| `templates/campaign/` | Campaign files: `STATE.md`, `OWNER.md` (your to-do list), `JOURNAL.md`, `TARGET.md`, `PROFILE.md`, `applications.csv`. |
+| `scripts/browser.py` | One local Chrome (Xvfb + CDP) shared by the agent and its helpers in parallel; survives crashes and restores tabs; `share` gives the remote link. |
+| `scripts/mail.py` | Full mailbox management: sweep, search, show, codes, attachments, labels, archive, trash, send (new mail only), guarded reply, drafts, bounces. IMAP/SMTP with an app password, or the Gmail API with OAuth (`mail.py auth`). |
+| `scripts/jobs.py` | Searches public job APIs and company ATS boards (Greenhouse, Lever, Ashby…) with seniority and paging filters, reads full adverts (`show URL`), and hides jobs already tracked. |
+| `scripts/track.py` | The application tracker (locked, so helpers can run in parallel; `waiting` lists what is blocked on you; `stats` shows skip reasons and sources) and site accounts with generated passwords. |
 | `scripts/setup.sh` | Machine and folder setup (safe to re-run). `setup.sh mail` stores an app password; `setup.sh google` walks you through the Gmail API sign-in. |
-| `DESIGN.md` | Why it is built this way, and lessons from the earlier ChatGPT run and the bug-bounty playbook. |
+| `DESIGN.md` | Why it is built this way: lessons from the first full run, the earlier ChatGPT run and the bug-bounty playbook. |
 
 ## Requirements
 - Linux with `python3` (3.8+), `git`, Google Chrome or Chromium, `Xvfb`, `x11vnc`, `pdftotext`.
-- `setup.sh` installs the rest where it can: Playwright (in `.venv`), websockify, noVNC, cloudflared.
+- `setup.sh` installs the rest where it can: Playwright, BeautifulSoup and PyMuPDF (for retitling the
+  CV; AGPL) in `.venv`, plus websockify, noVNC and cloudflared.
 - **Machine-local, never in git:**
   - `~/.config/job-autopilot/mail.env`: mailbox address, and the app password or Gmail API sign-in (refresh token);
-  - `~/.config/job-autopilot/PROFILE.md`: answers carried between campaigns;
+  - `~/.config/job-autopilot/PROFILE.md`: your facts and standing answers, carried between campaigns;
+  - `~/.config/job-autopilot/jobs.env`: optional job-board API keys;
   - `~/.local/state/job-autopilot/`: the Chrome profile, which holds the site logins;
   - each campaign's `secrets/accounts.json`: site passwords.
 

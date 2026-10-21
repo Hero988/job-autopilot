@@ -8,16 +8,19 @@ CDP and works in its own tabs. The owner can watch and control it from any PC th
 
 ```bash
 python3 .autopilot/scripts/browser.py start       # idempotent; safe to run before every task
-python3 .autopilot/scripts/browser.py status      # running?, tab count, share active + expiry
+python3 .autopilot/scripts/browser.py status      # running?, tabs, Chrome start time, restarts, share
 python3 .autopilot/scripts/browser.py tabs        # id, title, url (query strings removed)
-python3 .autopilot/scripts/browser.py close ID    # close a tab you opened and lost track of
+python3 .autopilot/scripts/browser.py close ID    # close a tab by id (works on frozen tabs too)
 python3 .autopilot/scripts/browser.py share       # owner link (see Handoff); --minutes N, default 60
 python3 .autopilot/scripts/browser.py unshare     # end the owner link
 python3 .autopilot/scripts/browser.py stop        # everything down; only when the campaign stops
 ```
 
-`start` detaches (Chrome outlives your shell) and recovers from a crash. `close --all` closes every
-tab but one `about:blank`; use it only when no other agent is working.
+`start` detaches, so Chrome outlives your shell. Closing the last tab does not quit Chrome.
+
+## Parallel use
+Several workers use the browser **at the same time**, each in its own tabs. There are no turns
+and no "sole browser worker".
 
 ## Connecting with Playwright
 Run browser code with `./.venv/bin/python` (setup.sh installed Playwright there; system `python3`
@@ -33,71 +36,80 @@ from playwright.sync_api import sync_playwright
 with sync_playwright() as p:
     b, ctx = browser.connect(p)          # starts Chrome if needed; ctx holds the saved logins
     page = browser.new_tab(ctx, "https://jobs.example.com/apply/123")   # background tab
+    tid = browser.target_id(ctx, page)   # save this (e.g. in work/<ID>.tab)
     page.wait_for_load_state()
     page.fill("#email", "candidate@example.com")
+    b.close()                            # disconnects only; Chrome and the tab stay
+
+# a later script (a new process):
+with sync_playwright() as p:
+    b, ctx = browser.connect(p)
+    page = browser.find_tab(ctx, tid)    # None if the tab is gone
     page.click("text=Continue")
-    page.screenshot(path="evidence/acme-step1.png")
-    page.close()                         # close YOUR tabs, and only yours
-    b.close()                            # disconnects only; Chrome keeps running
+    page.close()                         # close YOUR tab when the job is done
+    b.close()
 ```
 
-These rules were checked on this machine:
-- **Disconnect with `b.close()`** (or by leaving the `with` block). On a CDP connection this only
-  disconnects. Chrome and the other agents' tabs keep running. Never kill Chrome processes.
+Rules (checked on this machine):
+- **Each script is a new process.** A `Page` object dies with it. Save `browser.target_id(ctx, page)`
+  and get the tab back with `browser.find_tab(ctx, id)`. **Never pick tabs by URL or title**:
+  other agents have tabs on the same sites. Never close or navigate a tab you didn't open.
+- **Disconnect with `b.close()`**: on a CDP connection it only disconnects. Never kill Chrome.
 - **Open tabs with `browser.new_tab`, not `ctx.new_page()`.** `ctx.new_page()` and
   `new_tab(..., background=False)` jump to the front and take over the owner's view.
-  `new_tab` opens the tab behind the active one.
-- **Background tabs are fully automatable** (fill, click, type, screenshots). Some clicks take
-  about 1.5 s longer because hidden tabs render slowly. That is normal; don't bring the tab forward.
+- **Background tabs are automatable** (fill, click, type). Some clicks take about 1.5 s longer;
+  don't bring the tab forward. Screenshots of hidden tabs can time out: use
+  `page.screenshot(path=..., timeout=15000)` once, and if it fails save
+  `page.inner_text("body")` to a `.txt` file instead. Either is proof; don't retry in a loop.
 - **Don't trust `document.visibilityState`.** Playwright makes every tab report `visible`.
-- **Several agents can be connected at once.** Each one's `ctx.pages` also lists the other agents'
-  tabs. Keep your own `Page` objects and never close or navigate a tab you didn't open.
 - Never print cookies, storage state or tokens. Strip query strings from URLs you log.
 
 ## Handoff: when only the owner can act
-Some steps need the owner: a CAPTCHA or "are you human" check, a sign-in that needs their phone,
-an SMS code typed on the page. The procedure:
+CAPTCHAs, "are you human" checks, phone sign-ins and SMS codes typed on a page are the owner's.
+They are **batched**: when one blocks a form, set the job WAITING with a `CHECK:` note, close the
+tab and move on. When the owner is active (or in the daily summary), offer the whole batch in one
+session:
 
-1. `python3 .autopilot/scripts/browser.py share` prints `{"url": ..., "expires": ...}`. This takes
-   about a minute, because it waits until the link works from the public internet. Running it again
-   while the share is active prints the same link.
-2. Put the page in front: `page = browser.handoff_tab(ctx, url)` opens the URL in its own maximised
-   window, in front. To hand over a tab you already filled, pass the `Page` instead:
-   `browser.handoff_tab(ctx, page)`. It stays where it is (state kept) and is brought to the front.
-3. Ask the owner in a normal chat message (the harness's built-in chat). Include:
-   - the link;
-   - which site and exactly what to do ("solve the check on the Acme application page, then
-     press Submit");
-   - "this link gives full control of the job browser and expires at <expires>";
-   - "reply 'done' when finished".
-4. **Never write the link into any file**: not STATE.md, JOURNAL.md, notes, commits or logs (only
-   browser.py's private state keeps it, mode 600). The password is in the link. In STATE.md, note the open handoff under **"Handoff open"** with the
-   site and tab title only.
-5. Keep working on other applications in background tabs while you wait (`new_tab` doesn't
-   disturb the owner's window). Don't navigate, reload or close the handoff tab.
-6. When the owner replies "done", check the page (a signed-in page, a confirmation), carry on,
-   close the handoff tab, run `browser.py unshare`, and clear "Handoff open" in STATE.md.
+1. `python3 .autopilot/scripts/browser.py share` prints `{"url": ..., "expires": ...}`. It takes
+   about a minute. Running it again, even while the first call is starting, returns the same
+   link. Use `--minutes` to cover the batch.
+2. Open the checks one at a time with `page = browser.handoff_tab(ctx, url)` (its own maximised
+   window, in front). A tab you already filled: `browser.handoff_tab(ctx, page)` raises it as is.
+3. Ask the owner in one chat message: the link; the list of sites and what to do on each ("solve
+   the check, then press Submit"); "this link gives full control of the job browser and expires
+   at <expires>"; "reply 'done' when finished".
+4. **Never write the link into any file** (STATE.md, JOURNAL.md, notes, commits, logs). The
+   password is in it.
+5. Keep applying in background tabs meanwhile. Don't navigate, reload or close handoff tabs.
+6. When the owner replies, check each page, finish the job, close its tab, then `unshare`.
 
-The share ends by itself after `--minutes` (default 60). If the owner says the link doesn't work,
-run `unshare` and then `share` to get a new link, and send it in a new message. The tunnel is a free
-Cloudflare quick tunnel with no uptime guarantee, so a link can occasionally drop.
+Ask at once, outside the batch, only for a time-critical code in a flow the owner started. The
+share ends by itself after `--minutes`. If the link doesn't work (free quick tunnels can drop),
+`unshare`, `share` again and send the new link.
 
 ## Never
 - **Never solve or bypass a CAPTCHA or bot check automatically.** No solver services, no
-  clicking the checkbox from code, no retry loops or new tabs to dodge a check. Only the owner
-  solves one, through the handoff.
-- **Never launch a second browser**: no `p.chromium.launch()`, no other Chrome or Chromium, no
-  headless copy. **Never use the harness's own browser tool.** Logins live only in the shared
-  profile.
-- Never leave your tabs open when you finish a task, and never close other agents' tabs.
-- Never put the share link anywhere except the chat message to the owner.
+  clicking the checkbox from code, no retry loops or new tabs to dodge a check.
+- **Never launch a second browser**: no `p.chromium.launch()`, no other Chrome, no headless copy,
+  no harness browser tool. Logins live only in the shared profile. Never write your own CDP client.
+- Never leave your tabs open when you finish a job, and never close other agents' tabs.
 - Never run `browser.py stop` while other agents may be working.
 
 ## When things go wrong
+- **`connect` fails after 30 s with a list of tabs:** one tab is hung (frozen page or open dialog)
+  and blocks every agent. If it is yours, `browser.py close ID`; otherwise tell the lead.
+  `connect(p, timeout=...)` takes milliseconds.
+- **Chrome restarted:** `start`/`connect` print a notice on stderr, and `status` shows the new
+  start time and a restart count. The last tabs are reopened under **new ids**, so saved ids
+  return `None` and filled forms may be empty: reopen the job from its URL. If you had clicked
+  Submit, look for proof before redoing it: an acknowledgement email, the site's "my
+  applications", or the success URL in Chrome's history:
+  ```bash
+  cp ~/.local/state/job-autopilot/chrome-profile/Default/History /tmp/h.sqlite   # read a copy
+  python3 -c "import sqlite3; print(sqlite3.connect('/tmp/h.sqlite').execute(\"SELECT url FROM urls WHERE url LIKE '%example.com/apply%' ORDER BY last_visit_time DESC LIMIT 5\").fetchall())"
+  ```
 - **`start` fails:** read `~/.local/state/job-autopilot/logs/chrome.log` (or `xvfb.log`), run
   `browser.py stop`, then `start` again.
-- **`connect` fails:** run `browser.py status`; if `running` is false, run `start`.
-- **Signed out of a site:** sign in again in the shared Chrome. If a human check appears, do a
-  handoff.
-- **`share` fails:** it prints the reason; logs are in `~/.local/state/job-autopilot/logs/`. If
-  cloudflared gets no tunnel, retry in a few minutes and keep working meanwhile.
+- **Signed out of a site:** sign in again in the shared Chrome; a human check goes to the batch.
+- **`share` fails:** it prints the reason (logs as above). `unshare` also stops processes left by
+  an interrupted share. If cloudflared gets no tunnel, retry in a few minutes.

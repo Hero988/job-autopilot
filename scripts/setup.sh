@@ -6,8 +6,9 @@
 #   bash .autopilot/scripts/setup.sh google [CLIENT.json] [--skip-to N]
 #                                             no App passwords on the account? sign in to the Gmail API instead (guided)
 #
-# The campaign folder gets the templates (never overwriting your files), cv/ letters/ evidence/ secrets/, and a
-# Python venv (.venv) with Playwright. Machine-wide config lives in ~/.config/job-autopilot/ (never in git).
+# The campaign folder gets the templates (never overwriting your files), cv/ letters/ evidence/ next-steps/ work/
+# secrets/, and a Python venv (.venv) with Playwright, websockify, BeautifulSoup and PyMuPDF. Machine-wide config
+# lives in ~/.config/job-autopilot/ (never in git): mail.env, jobs.env (optional job-API keys), PROFILE.md.
 set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONF="$HOME/.config/job-autopilot"
@@ -112,21 +113,26 @@ fi
 
 echo "== Campaign folder: $PWD"
 if [ "$PWD" = "$REPO" ]; then echo "Run this from your campaign folder, not from the repo itself."; exit 2; fi
-for f in AGENTS.md CLAUDE.md STATE.md JOURNAL.md TARGET.md PROFILE.md applications.csv; do
-  [ -e "$f" ] || { cp "$REPO/templates/campaign/$f" "$f" && ok "created $f"; }
+for f in AGENTS.md CLAUDE.md STATE.md JOURNAL.md TARGET.md PROFILE.md OWNER.md applications.csv; do
+  [ -e "$f" ] || [ ! -e "$REPO/templates/campaign/$f" ] || { cp "$REPO/templates/campaign/$f" "$f" && ok "created $f"; }
 done
 [ -e .gitignore ] || cp "$REPO/templates/campaign/gitignore" .gitignore
+[ -e "$CONF/PROFILE.md" ] && chmod 600 "$CONF/PROFILE.md"
 if [ -s "$CONF/PROFILE.md" ] && cmp -s PROFILE.md "$REPO/templates/campaign/PROFILE.md"; then
   cp "$CONF/PROFILE.md" PROFILE.md && ok "PROFILE.md filled from $CONF/PROFILE.md (earlier campaigns)"
 fi
-mkdir -p cv letters evidence && mkdir -p -m 700 secrets && chmod 700 secrets
+mkdir -p cv letters evidence next-steps work && mkdir -p -m 700 secrets && chmod 700 secrets
 
-echo "== Python and Playwright"
+echo "== Python packages (.venv)"
+# playwright drives the shared Chrome; websockify serves the noVNC share; beautifulsoup4 parses pages;
+# pymupdf retitles the CV per job (PyMuPDF is AGPL-3.0: installed locally, never bundled with this MIT repo).
+PKGS="playwright websockify beautifulsoup4 pymupdf"
 if [ ! -x .venv/bin/python ]; then python3 -m venv .venv || miss "python3 venv (apt install python3-venv)"; fi
 if [ -x .venv/bin/python ]; then
-  .venv/bin/python -c "import playwright" 2>/dev/null || .venv/bin/pip install -q playwright websockify >/dev/null 2>&1
-  .venv/bin/python -c "import playwright" 2>/dev/null && ok "playwright in .venv (uses system Chrome; no browser download)" \
-    || miss "playwright (.venv/bin/pip install playwright)"
+  imports="import playwright, websockify, bs4, pymupdf"
+  .venv/bin/python -c "$imports" 2>/dev/null || .venv/bin/pip install -q $PKGS >/dev/null 2>&1
+  .venv/bin/python -c "$imports" 2>/dev/null && ok "$PKGS in .venv (Playwright uses system Chrome; no browser download)" \
+    || miss "python packages (.venv/bin/pip install $PKGS)"
 fi
 
 echo "== Machine tools"
@@ -166,6 +172,15 @@ else
   echo "          or 'bash $REPO/scripts/setup.sh google' (Gmail API) if the account has no App passwords"
 fi
 [ -s "$CONF/PROFILE.md" ] || echo "  note: no $CONF/PROFILE.md yet (it is created as the campaign learns answers)"
+
+echo "== Job API keys (optional)"
+JOBSENV="$CONF/jobs.env"
+[ -e "$JOBSENV" ] && chmod 600 "$JOBSENV"
+if grep -qs '^\(export \)\?REED_API_KEY=..*' "$JOBSENV"; then ok "Reed API key in $JOBSENV"; else
+  echo "  note: no Reed key. Free at https://www.reed.co.uk/developers (UK jobs): add REED_API_KEY=<key> to $JOBSENV"; fi
+if grep -qs '^\(export \)\?ADZUNA_APP_KEY=..*' "$JOBSENV"; then ok "Adzuna API key in $JOBSENV"; else
+  echo "  note: no Adzuna key. Free at https://developer.adzuna.com: add ADZUNA_APP_ID=<id> and ADZUNA_APP_KEY=<key>"; fi
+echo "  (check with: python3 $REPO/scripts/jobs.py sources)"
 
 echo "== Done. $( [ "$MISSING" = 0 ] && echo 'Everything is ready.' || echo 'Fix the MISSING items above (others can proceed).')"
 echo "   Repo commit: $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"

@@ -1,36 +1,55 @@
 #!/usr/bin/env python3
-"""jobs.py - find job openings in public job APIs and feeds. Python 3.8+, stdlib only. JSON on stdout.
+"""jobs.py - find job openings in public job APIs and feeds, and read adverts. Python 3.8+, stdlib only. JSON out.
 
   python3 jobs.py search --q "customer service" [--q "customer support"].. [--where uk|europe|anywhere]
-                  [--days 14] [--max 100] [--per-company 3] [--new] [--remote] [--title-only] [--json-lines]
+                  [--level entry|mid|senior|any] [--days 14] [--max 100] [--pages 2] [--per-company 3] [--new]
+                  [--remote] [--title-only] [--full] [--keep-commission] [--json-lines]
         Ask every source at once and keep jobs whose title or description contains any --q (case-insensitive;
         --title-only: title only), that a person in --where may take (default anywhere), posted in the last
         --days (0 = any age). Deduped by URL and company+title; title matches first, then newest. Prints
-        {"count","jobs":[{title,company,location,remote,url,posted,source,salary,snippet,match}],"errors":[..],
-         "sources":{name:kept},"fetched":{name:raw},"keyed_sources_off":[..]}
+        {"count","jobs":[{title,company,location,remote,url,posted,source,salary,seniority,snippet,match}],
+         "errors":[..],"sources":{name:kept},"fetched":{name:raw},"dropped":{reason:n},"keyed_sources_off":[..]}
+        --level        entry: Himalayas entry-level only, and drop senior/lead/manager/principal/head/director
+                       titles (or feed levels) everywhere; mid: entry + mid-level, drop principal/head/director/VP titles;
+                       senior: Himalayas senior and above; any (default): no filter
+        --pages N      pages per query for paged sources (Himalayas 20/page, Reed 100, Adzuna 50; default 2)
+        --full         print the whole description ("description") instead of a 300-character "snippet"
         --new          hide jobs whose URL or company+role is already in ./applications.csv
         --remote       keep only jobs marked remote, or unknown but saying remote/work from home
         --per-company  at most N jobs per company (default 3; 0 = no cap). Some advertisers post 40 clones.
+        --keep-commission  keep adverts saying "commission only" or "self-employed sales" (dropped by default)
         --json-lines   one job per line on stdout; the summary line goes to stderr
-  python3 jobs.py board ATS COMPANY [--q TEXT].. [--where ..] [--days N]
+  python3 jobs.py board ATS COMPANY [--q TEXT].. [--where ..] [--days N] [--level ..] [--full]
         A company's open jobs from its public ATS feed, same shape. COMPANY is the token in its jobs URL:
           greenhouse  job-boards.greenhouse.io/<token>   lever       jobs.lever.co/<token>
           ashby       jobs.ashbyhq.com/<token>           workable    apply.workable.com/<token>
           recruitee   <token>.recruitee.com              teamtailor  <token>.teamtailor.com
           personio    <token>.jobs.personio.de           smartrecruiters  jobs.smartrecruiters.com/<CompanyId>
+  python3 jobs.py show URL [--full]        (alias: advert URL)
+        Fetch one job page and print {"url","title","posting","apply_links","text"}: "posting" is the page's
+        schema.org JobPosting (title, company, dates, location, salary, description) when it has one; "text" is
+        the readable page text, left out when the posting has a description unless --full. Pages built by
+        JavaScript with no posting, or behind a bot check, need a browser tab instead.
   python3 jobs.py sources
-        Ping every source and one known board per ATS: ok, latency_s, count.
+        Ping every source and one known board per ATS: ok, latency_s, count; says how to switch on keyed sources.
 
-No-key sources (checked live 2026-10-20): Himalayas, Jobicy, Workable job search, NHS Jobs, RemoteOK,
-We Work Remotely, Working Nomads, Remotive (its free feed is only 10 jobs, 24 h late), Arbeitnow (mostly DE/EU).
-Keyed, on only when set: REED_API_KEY (reed.co.uk/developers), ADZUNA_APP_ID + ADZUNA_APP_KEY (developer.adzuna.com).
+No-key sources (checked live 2026-10-21): Himalayas (seniority filter; its url is a himalayas.app page behind a bot
+check: find the employer's own advert to apply), Jobicy, Workable job search, RemoteOK, We Work Remotely, Working
+Nomads, Remotive (its free feed is only 10 jobs, 24 h late), Arbeitnow (mostly DE/EU). The worldwide-remote feeds
+rarely allow a given country; check eligibility.
+Keyed, on only when set in the environment or in ~/.config/job-autopilot/jobs.env (KEY=VALUE lines, mode 600):
+REED_API_KEY (free: reed.co.uk/developers; UK; its search descriptions are cut short, so `show` the url),
+ADZUNA_APP_ID + ADZUNA_APP_KEY (free: developer.adzuna.com; GB here).
 Feeds ask for attribution: keep each job's url and source. LinkedIn, Indeed, Glassdoor, Totaljobs, CV-Library
-forbid scraping in their terms: this script never calls them; the agent browses those by hand. Dropped: DWP Find a
-Job (WAF blocks scripts), Guardian Jobs RSS (empty), Remote.co, EuropeRemotely, Jobgether, JustRemote (no feed).
-Exit: 0 ok, 1 every source failed or the board fetch failed, 2 usage.
+forbid scraping in their terms: this script never calls them; the agent browses those by hand. Dropped: NHS Jobs
+(since 2026-10-21 its CloudFront answers 403 for the whole site, API included, whatever the user agent, at least
+from cloud and non-UK networks; browse it by hand), DWP Find a Job (WAF blocks scripts), Guardian Jobs RSS (empty), Remote.co, EuropeRemotely, Jobgether,
+JustRemote (no feed).
+Exit: 0 ok, 1 every source failed or the board/page fetch failed, 2 usage.
 """
 import base64, csv, html, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -50,6 +69,23 @@ EU = re.compile(r"\b(ireland|germany|deutschland|france|spain|portugal|italy|net
 FILLER = re.compile(r"\b(remote|remotely|fully|full|work from home|wfh|home|based|hybrid|flexible|telecommute|or|"
                     r"and|only|n/?a|none|any|location|locations|timezones?|in the world|the|world|first)\b|[^a-z]+")
 REMOTE_TXT = re.compile(r"remote|work from home|home[- ]based|wfh|telecommute", re.I)
+# --level: Himalayas seniority values (comma = any of), and job titles dropped for every source
+LEVELS = {"entry": "Entry-level", "mid": "Entry-level,Mid-level", "senior": "Senior,Manager,Director,Executive"}
+TOO_SENIOR = {"entry": re.compile(r"\b(senior|sr|snr|lead(?! gen)|leader|supervisor|principal|staff|head of|director|manager|vp|"
+                                  r"vice president|chief|partner)\b", re.I),
+              "mid": re.compile(r"\b(principal|head of|director|vp|vice president|chief)\b", re.I)}
+COMMISSION = re.compile(r"(?<!not )(?<!non-)(?<!non )commission[- ]only|self[- ]employed sales", re.I)
+KEYS_FILE = os.path.expanduser("~/.config/job-autopilot/jobs.env")
+KEY_HELP = {"reed": "free key: reed.co.uk/developers", "adzuna": "free key: developer.adzuna.com"}
+
+def load_keys(path=KEYS_FILE):
+    """KEY=VALUE lines (like mail.env) for keys not already in the environment."""
+    if os.path.isfile(path):
+        for line in open(path, encoding="utf-8"):
+            k, eq, v = re.sub(r"^\s*export\s+", "", line.strip()).partition("=")
+            k = k.strip()
+            if eq and k and not k.startswith("#") and not os.environ.get(k):
+                os.environ[k] = v.strip().strip("'\"")
 
 def out(obj, code=0):
     print(json.dumps(obj, indent=2, ensure_ascii=False))
@@ -105,36 +141,40 @@ def money(lo, hi=None, cur="", per=""):
     rng = (lo + ("-" + hi if hi and hi != lo else "")) if lo else hi
     return " ".join(p for p in (str(cur or "").upper(), rng, "/" + str(per) if per else "") if p)
 
-def job(title, company, location, remote, url, posted, source, salary=None, desc=""):
+def job(title, company, location, remote, url, posted, source, salary=None, desc="", seniority=None):
     d, t = text(desc), when(posted)
     return {"title": text(title), "company": text(company), "location": text(location), "remote": remote,
             "url": url or "", "posted": t.date().isoformat() if t else None, "source": source,
-            "salary": salary or None, "snippet": d[:300], "_desc": d, "_t": t.timestamp() if t else 0}
+            "salary": salary or None, "seniority": seniority, "snippet": d[:300], "_desc": d,
+            "_t": t.timestamp() if t else 0}
 
 def guess_remote(*parts):
     return True if REMOTE_TXT.search(" ".join(str(p or "") for p in parts)) else None
 
-# ---------------------------------------------------------------- search sources: fn(query, where, page, remote_only)
-def s_himalayas(q, where, page, _):
-    d = fetch("https://himalayas.app/jobs/api/search?" +
-              qs(q=q, sort="recent", page=page, country="United Kingdom" if where == "uk" else None))
+# ---------------------------------------------------------------- search sources: fn(query, args, page)
+def s_himalayas(q, a, page):
+    d = fetch("https://himalayas.app/jobs/api/search?" + qs(
+        q=q, sort="recent", page=page, country="United Kingdom" if a["where"] == "uk" else None,
+        seniority=LEVELS.get(a["level"])))
     return [job(j.get("title"), j.get("companyName"), ", ".join(j.get("locationRestrictions") or []) or "Worldwide",
                 True, j.get("applicationLink") or j.get("guid"), j.get("pubDate"), "himalayas",
                 money(j.get("minSalary"), j.get("maxSalary"), j.get("currency"), j.get("salaryPeriod")),
-                j.get("excerpt") or j.get("description")) for j in d.get("jobs", [])]
+                j.get("description") or j.get("excerpt"), ", ".join(j.get("seniority") or []) or None)
+            for j in d.get("jobs", [])]
 
-def s_jobicy(q, where, page, _):
-    d = fetch("https://jobicy.com/api/v2/remote-jobs?" + qs(count=50, tag=q, geo=where if where != "anywhere" else ""))
+def s_jobicy(q, a, page):
+    w = a["where"]
+    d = fetch("https://jobicy.com/api/v2/remote-jobs?" + qs(count=50, tag=q, geo=w if w != "anywhere" else ""))
     return [job(j.get("jobTitle"), j.get("companyName"), j.get("jobGeo"), True, j.get("url"), j.get("pubDate"),
                 "jobicy", money(j.get("salaryMin"), j.get("salaryMax"), j.get("salaryCurrency"), j.get("salaryPeriod")),
-                j.get("jobExcerpt") or j.get("jobDescription")) for j in d.get("jobs", [])]
+                j.get("jobDescription") or j.get("jobExcerpt"), j.get("jobLevel")) for j in d.get("jobs", [])]
 
-def s_workable(q, where, page, remote_only):
-    """jobs.workable.com search API (its robots.txt allows /api; it disallows /search?...). Two pages of 20."""
-    p = {"query": q, "location": "United Kingdom" if where == "uk" else None,
-         "workplace": "remote" if remote_only else None}
+def s_workable(q, a, page):
+    """jobs.workable.com search API (its robots.txt allows /api; it disallows /search?...). --pages pages of 20."""
+    p = {"query": q, "location": "United Kingdom" if a["where"] == "uk" else None,
+         "workplace": "remote" if a["remote"] else None}
     rows = []
-    for _ in range(2):
+    for _ in range(a["pages"]):
         d = fetch("https://jobs.workable.com/api/v1/jobs?" + qs(**p))
         rows += d.get("jobs", [])
         p["pageToken"] = d.get("nextPageToken")
@@ -144,14 +184,6 @@ def s_workable(q, where, page, remote_only):
     return [job(j.get("title"), (j.get("company") or {}).get("title"), "; ".join(j.get("locations") or []),
                 wp.get(j.get("workplace")), j.get("url"), j.get("created"), "workable", None, j.get("description"))
             for j in rows]
-
-def s_nhs(q, where, page, _):
-    rows, r = [], fetch("https://www.jobs.nhs.uk/api/v1/search_xml?" + qs(keyword=q, page=page), kind="xml")
-    for v in r.iter("vacancyDetails"):
-        f, loc = v.findtext, ", ".join(x.text or "" for x in v.findall("locations/location")) + ", UK"
-        rows.append(job(f("title"), f("employer"), loc, guess_remote(f("title"), loc), f("url"), f("postDate"), "nhs",
-                        f("salary"), f("description")))
-    return rows
 
 def s_remoteok(*_):
     return [job(j.get("position"), j.get("company"), j.get("location"), True, j.get("url"), j.get("epoch"), "remoteok",
@@ -183,19 +215,20 @@ def s_arbeitnow(*_):
                 j.get("url"), j.get("created_at"), "arbeitnow", None, j.get("description"))
             for j in fetch("https://www.arbeitnow.com/api/job-board-api").get("data", [])]
 
-def s_reed(q, where, page, _):
-    """Reed API docs: basic auth, username = key, empty password. UK only."""
+def s_reed(q, a, page):
+    """Reed API docs: basic auth, username = key, empty password. UK only. Descriptions are cut short."""
     auth = base64.b64encode((os.environ.get("REED_API_KEY", "") + ":").encode()).decode()
-    d = fetch("https://www.reed.co.uk/api/1.0/search?" + qs(keywords=q, resultsToTake=100),
+    d = fetch("https://www.reed.co.uk/api/1.0/search?" + qs(keywords=q, resultsToTake=100,
+                                                            resultsToSkip=(page - 1) * 100 or None),
               headers={"Authorization": "Basic " + auth})
     return [job(j.get("jobTitle"), j.get("employerName"), (j.get("locationName") or "") + ", UK",
                 guess_remote(j.get("jobTitle"), j.get("locationName"), j.get("jobDescription")), j.get("jobUrl"),
                 j.get("date"), "reed", money(j.get("minimumSalary"), j.get("maximumSalary"), j.get("currency") or
                                              "GBP"), j.get("jobDescription")) for j in d.get("results", [])]
 
-def s_adzuna(q, where, page, _):
+def s_adzuna(q, a, page):
     """Adzuna API docs: /v1/api/jobs/gb/search/<page>?app_id&app_key&what. Great Britain only here."""
-    d = fetch("https://api.adzuna.com/v1/api/jobs/gb/search/1?" + qs(
+    d = fetch("https://api.adzuna.com/v1/api/jobs/gb/search/%d?" % page + qs(
         app_id=os.environ.get("ADZUNA_APP_ID"), app_key=os.environ.get("ADZUNA_APP_KEY"), what=q,
         results_per_page=50, sort_by="date", **{"content-type": "application/json"}))
     return [job(j.get("title"), (j.get("company") or {}).get("display_name"),
@@ -204,15 +237,30 @@ def s_adzuna(q, where, page, _):
                 money(j.get("salary_min"), j.get("salary_max"), "GBP"), j.get("description"))
             for j in d.get("results", [])]
 
-# name: (fn, pages per query (0 = one call, not per query), env vars it needs)
-SOURCES = {"himalayas": (s_himalayas, 2, ()), "jobicy": (s_jobicy, 1, ()), "workable": (s_workable, 1, ()),
-           "nhs": (s_nhs, 2, ()), "remoteok": (s_remoteok, 0, ()), "weworkremotely": (s_weworkremotely, 0, ()),
-           "workingnomads": (s_workingnomads, 0, ()), "remotive": (s_remotive, 0, ()),
-           "arbeitnow": (s_arbeitnow, 0, ()),
-           "reed": (s_reed, 1, ("REED_API_KEY",)), "adzuna": (s_adzuna, 1, ("ADZUNA_APP_ID", "ADZUNA_APP_KEY"))}
+# name: (fn, calls: "page" = per query and page (--pages), "query" = once per query, "once" = one call; env vars)
+SOURCES = {"himalayas": (s_himalayas, "page", ()), "jobicy": (s_jobicy, "query", ()),
+           "workable": (s_workable, "query", ()), "remoteok": (s_remoteok, "once", ()),
+           "weworkremotely": (s_weworkremotely, "once", ()), "workingnomads": (s_workingnomads, "once", ()),
+           "remotive": (s_remotive, "once", ()), "arbeitnow": (s_arbeitnow, "once", ()),
+           "reed": (s_reed, "page", ("REED_API_KEY",)), "adzuna": (s_adzuna, "page", ("ADZUNA_APP_ID", "ADZUNA_APP_KEY"))}
 
 def keyed_off():
     return [n for n, (_, _, env) in SOURCES.items() if not all(os.environ.get(k) for k in env)]
+
+def paged(fn, q, a):
+    """Pages 1..--pages in order; stop at an empty page (the end of the results; Himalayas pages vary in size)."""
+    rows = []
+    for p in range(1, a["pages"] + 1):
+        try:
+            got = fn(q, a, p)
+        except Exception:
+            if p == 1:
+                raise
+            break  # keep the pages already fetched
+        if not got:
+            break
+        rows += got
+    return rows
 
 # ---------------------------------------------------------------- ATS boards: fn(company, queries)
 def b_greenhouse(c, _):
@@ -330,10 +378,12 @@ def tracked(path="applications.csv"):
             {norm_key(r.get("company"), r.get("role")) for r in rows} - {"|"})
 
 def refine(rows, a, cap=0):
+    """Filter, dedupe and cap. Returns (jobs, dropped) where dropped counts level and commission-only drops."""
     words = [re.sub(r"[\s\-/]+", " ", q.lower()).strip() for q in a["q"]]
     cutoff = (datetime.now(timezone.utc) - timedelta(days=a["days"])).timestamp() if a["days"] else 0
     urls, keys = tracked() if a["new"] else (set(), set())
-    per, kept = {}, []
+    senior = TOO_SENIOR.get(a["level"])
+    per, kept, dropped = {}, [], Counter()
     for j in sorted(rows, key=lambda j: -j["_t"]):
         title = re.sub(r"[\s\-/]+", " ", j["title"].lower())
         desc = "" if a["title_only"] else re.sub(r"[\s\-/]+", " ", j["_desc"].lower())
@@ -346,11 +396,143 @@ def refine(rows, a, cap=0):
         u, k, c = norm_url(j["url"]), norm_key(j["company"], j["title"]), j["company"].lower()
         if u in urls or k in keys or (cap and per.get(c, 0) >= cap):
             continue
+        if senior and senior.search(j["title"] + " | " + (j["seniority"] or "")):  # title or the feed's own level
+            dropped["level"] += 1
+            continue
+        if not a["keep_commission"] and COMMISSION.search(j["title"] + " " + j["_desc"]):
+            dropped["commission_only"] += 1
+            continue
         urls.add(u)
         keys.add(k)
         per[c] = per.get(c, 0) + 1
+        if a["full"]:
+            del j["snippet"]
+            j["description"] = j["_desc"]
         kept.append({x: y for x, y in j.items() if not x.startswith("_")})
-    return sorted(kept, key=lambda j: j["match"] != "title")  # stable: newest first within each group
+    return sorted(kept, key=lambda j: j["match"] != "title"), dict(dropped)  # stable: newest first in each group
+
+# ---------------------------------------------------------------- reading one advert page
+class Page(HTMLParser):
+    """Readable text, <title>, links and JSON-LD blocks of an HTML page."""
+    SKIP = {"script", "style", "noscript", "svg", "template", "iframe", "button", "select", "option"}
+    BLOCK = {"p", "div", "br", "li", "ul", "ol", "tr", "table", "section", "article", "header", "footer", "h1", "h2",
+             "h3", "h4", "h5", "h6", "dd", "dt", "dl", "blockquote", "pre", "hr", "main", "form", "label"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts, self.links, self.ld, self.title = [], [], [], ""
+        self.skip, self.where, self.link = 0, None, None
+
+    def handle_starttag(self, tag, attrs):
+        at = dict(attrs)
+        if tag == "script" and (at.get("type") or "").lower() == "application/ld+json":
+            self.where = "ld"
+            self.ld.append("")
+        elif tag == "title" and not self.skip and not self.title:  # not an <svg><title>
+            self.where = "title"
+        if tag in self.SKIP:
+            self.skip += 1
+        elif tag in self.BLOCK:
+            self.parts.append("\n- " if tag == "li" else "\n")
+        if tag == "a" and at.get("href"):
+            self.link = [at["href"], ""]
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "title"):
+            self.where = None
+        if tag in self.SKIP:
+            self.skip = max(0, self.skip - 1)
+        elif tag in self.BLOCK:
+            self.parts.append("\n")
+        if tag == "a" and self.link:
+            self.links.append(self.link)
+            self.link = None
+
+    def handle_data(self, d):
+        if self.where == "ld":
+            self.ld[-1] += d
+        elif self.where == "title":
+            self.title += d
+        elif not self.skip:
+            self.parts.append(d)
+            if self.link:
+                self.link[1] += d
+
+    def text(self):
+        lines = (re.sub(r"[ \t\r\f\v\xa0]+", " ", l).strip() for l in "".join(self.parts).split("\n"))
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(l for l in lines if l not in ("", "-")))
+
+def job_posting(blocks):
+    """The first schema.org JobPosting in the page's JSON-LD, trimmed to what an applicant needs."""
+    todo = []
+    for b in blocks:
+        try:
+            todo.append(json.loads(b))
+        except ValueError:
+            continue
+    while todo:
+        x = todo.pop(0)
+        if isinstance(x, list):
+            todo += x
+            continue
+        if not isinstance(x, dict):
+            continue
+        todo += x.get("@graph") or []
+        kind = x.get("@type")
+        if "JobPosting" not in (kind if isinstance(kind, list) else [kind]):
+            continue
+        name = lambda v: v.get("name") if isinstance(v, dict) else v
+        def place(v):
+            v = v.get("address", v) if isinstance(v, dict) else v
+            if isinstance(v, dict):
+                return ", ".join(str(name(v.get(k))) for k in ("streetAddress", "addressLocality", "addressRegion",
+                                                               "postalCode", "addressCountry") if v.get(k))
+            return v
+        many = lambda v: [w for w in (v if isinstance(v, list) else [v]) if w]
+        sal = x.get("baseSalary") or {}
+        val = sal.get("value") if isinstance(sal, dict) else None
+        if isinstance(val, dict):
+            sal = money(val.get("minValue") or val.get("value"), val.get("maxValue"), sal.get("currency"),
+                        str(val.get("unitText") or "").lower())
+        p = {"title": x.get("title"), "company": name(x.get("hiringOrganization")),
+             "posted": x.get("datePosted"), "closes": x.get("validThrough"),
+             "employment_type": x.get("employmentType"), "location_type": x.get("jobLocationType"),
+             "locations": [place(l) for l in many(x.get("jobLocation"))],
+             "applicant_locations": [place(l) for l in many(x.get("applicantLocationRequirements"))],
+             "salary": sal or None, "description": text(x.get("description"))}
+        return {k: v for k, v in p.items() if v not in (None, "", [])}
+    return None
+
+def cmd_show(a):
+    if len(a["pos"]) != 2 or not re.match(r"https?://", a["pos"][1]):
+        usage()
+    url = a["pos"][1]
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; " + UA + ")",
+                                               "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw, final, cs = r.read(3_000_000), r.geturl(), r.headers.get_content_charset() or "utf-8"
+    except Exception as e:
+        hint = " (a bot check or block: open it in a browser tab)" if isinstance(e, urllib.error.HTTPError) \
+            and e.code in (401, 403, 429) else ""
+        out({"url": url, "error": err(e) + hint}, 1)
+    try:
+        page = raw.decode(cs, errors="replace")
+    except LookupError:  # a charset Python does not know (e.g. "utf8mb4")
+        page = raw.decode("utf-8", errors="replace")
+    pg = Page()
+    pg.feed(page)
+    body, posting = pg.text(), job_posting(pg.ld)
+    res = {"url": final, "title": re.sub(r"\s+", " ", pg.title).strip(), "posting": posting,
+           "apply_links": list(dict.fromkeys(urllib.parse.urljoin(final, h) for h, t in pg.links
+                                             if re.search(r"apply", t + " " + h, re.I)))[:10], "text": body}
+    if posting and posting.get("description") and not a["full"]:
+        del res["text"]  # the JobPosting description is the advert; --full keeps the page text too
+    if re.search(r"just a moment|attention required|verify you are human", res["title"], re.I):
+        res["note"] = "bot check page, not the advert: open it in a browser tab"
+    elif len(body) < 500 and not posting:
+        res["note"] = "little text: the page is probably built by JavaScript; open it in a browser tab"
+    out(res)
 
 # ---------------------------------------------------------------- commands
 def usage():
@@ -358,35 +540,46 @@ def usage():
     sys.exit(2)
 
 def parse(argv):
-    a = {"q": [], "where": "anywhere", "days": None, "max": 100, "per_company": 3, "new": False, "remote": False,
-         "title_only": False, "json_lines": False, "pos": []}
+    a = {"q": [], "where": "anywhere", "level": "any", "days": None, "max": 100, "pages": 2, "per_company": 3,
+         "new": False, "remote": False, "title_only": False, "full": False, "keep_commission": False,
+         "json_lines": False, "pos": []}
+    choices = {"--where": ("uk", "europe", "anywhere"), "--level": ("entry", "mid", "senior", "any")}
     it = iter(argv)
     for t in it:
         k = t[2:].replace("-", "_")
-        if t in ("--q", "--where", "--days", "--max", "--per-company"):
+        if t in ("--q", "--where", "--level", "--days", "--max", "--pages", "--per-company"):
             v = next(it, None)
-            if v is None or (t == "--where" and v not in ("uk", "europe", "anywhere")):
+            if v is None or (t in choices and v not in choices[t]):
                 usage()
             if t == "--q":
                 a["q"].append(v)
             else:
-                a[k] = v if t == "--where" else (int(v) if v.isdigit() else usage())
-        elif t in ("--new", "--remote", "--title-only", "--json-lines"):
+                a[k] = v if t in choices else (int(v) if v.isdigit() else usage())
+        elif t in ("--new", "--remote", "--title-only", "--full", "--keep-commission", "--json-lines"):
             a[k] = True
         elif t.startswith("-"):
             usage()
         else:
             a["pos"].append(t)
+    a["pages"] = max(1, a["pages"])
     return a
+
+def enable_hint(off):
+    return {n: "set %s in the environment or %s (%s)" % (" + ".join(SOURCES[n][2]), KEYS_FILE, KEY_HELP[n])
+            for n in off}
 
 def cmd_search(a):
     if not a["q"]:
         usage()
     a["days"] = 14 if a["days"] is None else a["days"]
     tasks = []
-    for name, (fn, pages, env) in [x for x in SOURCES.items() if x[0] not in keyed_off()]:
-        calls = [(q, a["where"], p, a["remote"]) for q in a["q"] for p in range(1, pages + 1)] if pages else [()]
-        tasks += [(name, fn, args) for args in calls]
+    for name, (fn, calls, env) in [x for x in SOURCES.items() if x[0] not in keyed_off()]:
+        if calls == "page":
+            tasks += [(name, paged, (fn, q, a)) for q in a["q"]]
+        elif calls == "query":
+            tasks += [(name, fn, (q, a, 1)) for q in a["q"]]
+        else:
+            tasks.append((name, fn, ()))
     rows, fetched, errors = [], {}, []
     with ThreadPoolExecutor(max_workers=16) as ex:
         for name, f in [(n, ex.submit(fn, *args)) for n, fn, args in tasks]:
@@ -396,9 +589,13 @@ def cmd_search(a):
                 fetched[name] = fetched.get(name, 0) + len(got)
             except Exception as e:  # one broken source never stops the run
                 errors.append({"source": name, "error": err(e)})
-    jobs = refine(rows, a, a["per_company"])[:a["max"]]
+    jobs, dropped = refine(rows, a, a["per_company"])
+    jobs = jobs[:a["max"]]
+    off = keyed_off()
     summary = {"count": len(jobs), "errors": errors, "sources": dict(Counter(j["source"] for j in jobs)),
-               "fetched": fetched, "keyed_sources_off": keyed_off()}
+               "fetched": fetched, "dropped": dropped, "keyed_sources_off": off}
+    if off:
+        summary["enable"] = enable_hint(off)
     code = 1 if errors and not fetched else 0
     if not a["json_lines"]:
         out(dict(summary, jobs=jobs), code)
@@ -416,32 +613,36 @@ def cmd_board(a):
         rows = BOARDS[ats](company, a["q"])
     except Exception as e:
         out({"ats": ats, "company": company, "error": err(e)}, 1)
-    jobs = refine(rows, a)
-    out({"ats": ats, "company": company, "count": len(jobs), "total": len(rows), "jobs": jobs})
+    jobs, dropped = refine(rows, a)
+    out({"ats": ats, "company": company, "count": len(jobs), "total": len(rows), "dropped": dropped, "jobs": jobs})
 
-def cmd_sources(_):
+def cmd_sources(a):
     def ping(fn, *args):
         t = time.time()
         return {"ok": True, "count": len(fn(*args)), "latency_s": round(time.time() - t, 2)}
 
-    tasks = {n: (fn,) + (("customer", "uk", 1, False) if pages else ()) for n, (fn, pages, _) in SOURCES.items()}
+    a["pages"] = 1
+    tasks = {n: (fn,) + (("customer", dict(a, where="uk"), 1) if calls != "once" else ())
+             for n, (fn, calls, _) in SOURCES.items()}
     tasks.update({"board:%s:%s" % (k, c): (BOARDS[k], c, ()) for k, c in BOARD_SAMPLES.items()})
-    res = {}
+    res, off = {}, keyed_off()
     with ThreadPoolExecutor(max_workers=20) as ex:
-        futs = {k: ex.submit(ping, *v) for k, v in tasks.items() if k not in keyed_off()}
+        futs = {k: ex.submit(ping, *v) for k, v in tasks.items() if k not in off}
         for k in tasks:
             if k not in futs:
-                res[k] = {"ok": None, "note": "off: set " + " + ".join(SOURCES[k][2])}
+                res[k] = {"ok": None, "note": "off: " + enable_hint([k])[k]}
                 continue
             try:
                 res[k] = futs[k].result()
             except Exception as e:
                 res[k] = {"ok": False, "error": err(e)}
     out({"sources": res, "ok": sum(1 for v in res.values() if v["ok"]),
-         "failed": [k for k, v in res.items() if v["ok"] is False]})
+         "failed": [k for k, v in res.items() if v["ok"] is False], "keyed_sources_off": off})
 
 def main():
-    cmd = {"search": cmd_search, "board": cmd_board, "sources": cmd_sources}.get((sys.argv + [""])[1])
+    load_keys()
+    cmd = {"search": cmd_search, "board": cmd_board, "sources": cmd_sources, "show": cmd_show,
+           "advert": cmd_show}.get((sys.argv + [""])[1])
     if not cmd:
         usage()
     cmd(parse(sys.argv[1:]))

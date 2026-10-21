@@ -21,4 +21,5 @@ MY SEARCH
 - Similar to: the remote customer service job at <company> I applied for (find it in my email, or: <link>); I want jobs very similar to it.
 - My CV: attached to this message (or: a file path / a link / "the latest CV in my email").
 - Mailbox: you@gmail.com
+- Optional: also hybrid within <45> minutes of <postcode> by public transport; anything else I want.
 ```
